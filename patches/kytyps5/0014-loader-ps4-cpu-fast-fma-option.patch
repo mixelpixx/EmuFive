@@ -1,0 +1,252 @@
+From: mixelpixx <11727006+mixelpixx@users.noreply.github.com>
+Subject: [PATCH] loader: PS4 CPU: opt-in fast FMA (KYTY_JAGUAR_FMA=fast), each FMA saves fewer registers
+
+Single-precision FMA is replaced by converting to double, multiplying and
+adding there and converting back, which is nearly always the fused result
+but costs a dozen conversions and four saved YMM registers per
+instruction. KYTY_JAGUAR_FMA=fast emits a multiply and an add or subtract
+at the instruction's own width and precision instead, each rounded, as
+code built without FMA would compute it:
+
+- The product goes straight to the destination when the addend is
+  another register or memory (132 and 213 forms): no scratch register.
+- When the addend is the destination (231 forms, or an alias), the
+  product goes to one scratch register.
+- Negation flips sign bits with XOR, so signed zeros come out as the
+  instruction defines them. Scalar forms keep the destination as the
+  first source, so its other elements stay.
+
+Results can differ from the fused ones, mostly where the sum cancels, and
+NaN signs and payloads follow the AVX instructions. Double precision gives
+the same numbers as the default, which is a multiply and an add too. The
+default stays exact.
+
+In the default mode, the FMA replacement saved t2 up to three times when
+t3 and t4 were t2: it now saves each register once.
+---
+diff --git a/src/loader/jaguarCompat.cpp b/src/loader/jaguarCompat.cpp
+--- a/src/loader/jaguarCompat.cpp
++++ b/src/loader/jaguarCompat.cpp
+@@ -10,6 +10,7 @@
+ #include <cstdlib>
+ #include <initializer_list>
+ #include <random>
++#include <span>
+ #include <string_view>
+ #include <utility>
+ #include <xbyak/xbyak.h>
+@@ -210,20 +211,26 @@ public:
+ 	}
+ 
+ 	// Saves (and later restores) full YMM scratch registers in the reserved room.
+-	void SaveVectors(std::initializer_list<int> regs) {
++	void SaveVectors(std::span<const int> regs) {
+ 		int slot = 0;
+ 		for (int reg: regs) {
+ 			g.vmovdqu(ptr[rsp + slot * 32], Xbyak::Ymm(reg));
+ 			++slot;
+ 		}
+ 	}
+-	void RestoreVectors(std::initializer_list<int> regs) {
++	void RestoreVectors(std::span<const int> regs) {
+ 		int slot = 0;
+ 		for (int reg: regs) {
+ 			g.vmovdqu(Xbyak::Ymm(reg), ptr[rsp + slot * 32]);
+ 			++slot;
+ 		}
+ 	}
++	void SaveVectors(std::initializer_list<int> regs) {
++		SaveVectors(std::span<const int>(regs.begin(), regs.size()));
++	}
++	void RestoreVectors(std::initializer_list<int> regs) {
++		RestoreVectors(std::span<const int>(regs.begin(), regs.size()));
++	}
+ };
+ 
+ // ---------------------------------------------------------------------------------------------
+@@ -790,6 +797,130 @@ bool GetFmaForm(ZydisMnemonic mnemonic, FmaForm* form) {
+ 	return false;
+ }
+ 
++// KYTY_JAGUAR_FMA=fast: a multiply and an add or subtract at the instruction's own width and
++// precision, rounded twice, as code compiled without FMA would do. Much cheaper than the exact
++// path, but the result can differ from the fused one (most of all when the sum cancels), and
++// NaN signs and payloads follow the AVX instructions. Double precision gives the same numbers as
++// the exact path, which is a multiply and an add too.
++bool FastFma() {
++	static const bool fast = [] {
++		const char* mode = std::getenv("KYTY_JAGUAR_FMA");
++		return mode != nullptr && std::string_view(mode) == "fast";
++	}();
++	return fast;
++}
++
++bool GenerateFastFma(Emitter& e, const FmaForm& form, bool wide) {
++	const int d = VectorId(e.ops[0].reg.value);
++	// product = a * b, result = product +/- c (operand indexes).
++	int a = 0;
++	int b = 0;
++	int c = 0;
++	switch (form.order) {
++		case 132: a = 0, b = 2, c = 1; break;
++		case 213: a = 1, b = 0, c = 2; break;
++		default: a = 1, b = 2, c = 0; break;
++	}
++	// The destination first when it is a factor, so that a scalar form keeps its upper elements
++	// (VMULSS takes them from its first source); otherwise the register first, since only
++	// operand 2 can be memory.
++	if (b == 0 || e.ops[a].type == ZYDIS_OPERAND_TYPE_MEMORY) {
++		std::swap(a, b);
++	}
++	const bool c_is_d = e.ops[c].type == ZYDIS_OPERAND_TYPE_REGISTER &&
++	                    VectorId(e.ops[c].reg.value) == d;
++	// The addend is the destination (231, or an alias): the product goes to a scratch register
++	// and is combined into the destination. VFMSUBADD needs one for -c either way.
++	const bool need_scratch = c_is_d || form.alternate == 2;
++	const int  t            = need_scratch ? e.Scratch() : 0;
++	if (!e.ok) {
++		return false;
++	}
++
++	const ZydisMnemonic mul = form.scalar ? (form.single ? ZYDIS_MNEMONIC_VMULSS : ZYDIS_MNEMONIC_VMULSD)
++	                                      : (form.single ? ZYDIS_MNEMONIC_VMULPS : ZYDIS_MNEMONIC_VMULPD);
++	const ZydisMnemonic add = form.scalar ? (form.single ? ZYDIS_MNEMONIC_VADDSS : ZYDIS_MNEMONIC_VADDSD)
++	                                      : (form.single ? ZYDIS_MNEMONIC_VADDPS : ZYDIS_MNEMONIC_VADDPD);
++	const ZydisMnemonic sub = form.scalar ? (form.single ? ZYDIS_MNEMONIC_VSUBSS : ZYDIS_MNEMONIC_VSUBSD)
++	                                      : (form.single ? ZYDIS_MNEMONIC_VSUBPS : ZYDIS_MNEMONIC_VSUBPD);
++	const ZydisMnemonic addsub = form.single ? ZYDIS_MNEMONIC_VADDSUBPS : ZYDIS_MNEMONIC_VADDSUBPD;
++	const auto reg = [&](int id) { return RegOp(wide ? YmmReg(id) : XmmReg(id)); };
++	const auto source = [&](int i) {
++		return e.ops[i].type == ZYDIS_OPERAND_TYPE_MEMORY ? e.Mem(i, 0, e.ops[i].size / 8)
++		                                                 : reg(VectorId(e.ops[i].reg.value));
++	};
++
++	// Sign bits, to negate exactly (signed zeros too): every element, or only element 0 for the
++	// scalar forms, whose other elements must stay.
++	const bool   negate_c = (c_is_d && form.subtract && form.alternate == 0) || form.alternate == 2;
++	const bool   negate_p = !c_is_d && form.negate_product;
++	Xbyak::Label sign;
++	if (negate_c || negate_p) {
++		Xbyak::Label next;
++		e.g.jmp(next);
++		e.g.align(8);
++		e.g.L(sign);
++		for (int i = 0; i < 4; ++i) {
++			const uint64_t bits = form.single ? 0x8000000080000000ULL : 0x8000000000000000ULL;
++			e.g.dq(!form.scalar ? bits : i == 0 ? (form.single ? 0x80000000ULL : bits) : 0);
++		}
++		e.g.L(next);
++	}
++	const auto flip = [&](int id) {
++		if (wide) {
++			form.single ? e.g.vxorps(Xbyak::Ymm(id), Xbyak::Ymm(id), ptr[rip + sign])
++			            : e.g.vxorpd(Xbyak::Ymm(id), Xbyak::Ymm(id), ptr[rip + sign]);
++		} else {
++			form.single ? e.g.vxorps(Xbyak::Xmm(id), Xbyak::Xmm(id), ptr[rip + sign])
++			            : e.g.vxorpd(Xbyak::Xmm(id), Xbyak::Xmm(id), ptr[rip + sign]);
++		}
++	};
++
++	if (need_scratch) {
++		e.Reserve(32);
++		e.SaveVectors({t});
++	}
++	if (c_is_d) {
++		// t = a * b, then the destination (c) is combined with it, staying the first source so
++		// that a scalar form keeps its upper elements.
++		e.Emit(mul, {reg(t), source(a), source(b)});
++		if (form.alternate != 0) {
++			// VADDSUB: even elements subtract. VFMADDSUB: p - c, p + c; VFMSUBADD: p + c, p - c.
++			if (form.alternate == 2) {
++				flip(d);
++			}
++			e.Emit(addsub, {reg(d), reg(t), reg(d)});
++		} else {
++			if (negate_c) {
++				flip(d); // -c, for p - c and -p - c.
++			}
++			// c + p, -c + p, c - p, -c - p.
++			e.Emit(form.negate_product ? sub : add, {reg(d), reg(d), reg(t)});
++		}
++	} else {
++		// d = a * b (a read before d is written), then +/- c.
++		e.Emit(mul, {reg(d), source(a), source(b)});
++		if (negate_p) {
++			flip(d);
++		}
++		if (form.alternate == 1) {
++			e.Emit(addsub, {reg(d), reg(d), source(c)});
++		} else if (form.alternate == 2) {
++			e.Emit(form.single ? ZYDIS_MNEMONIC_VMOVUPS : ZYDIS_MNEMONIC_VMOVUPD,
++			       {reg(t), source(c)});
++			flip(t);
++			e.Emit(addsub, {reg(d), reg(d), reg(t)});
++		} else {
++			e.Emit(form.subtract ? sub : add, {reg(d), reg(d), source(c)});
++		}
++	}
++	if (need_scratch) {
++		e.RestoreVectors({t});
++		e.Release(32);
++	}
++	return e.ok;
++}
++
+ bool GenerateFma(Emitter& e) {
+ 	FmaForm form;
+ 	if (!GetFmaForm(e.in.mnemonic, &form) || e.in.operand_count_visible != 3 ||
+@@ -810,6 +941,9 @@ bool GenerateFma(Emitter& e) {
+ 		case 213: a = 1, b = 0, c = 2; break;
+ 		default: a = 1, b = 2, c = 0; break;
+ 	}
++	if (FastFma()) {
++		return GenerateFastFma(e, form, wide);
++	}
+ 	const int t1 = e.Scratch();
+ 	const int t2 = e.Scratch();
+ 	const int t3 = wide && form.single ? e.Scratch() : t2; // Upper result of 8 floats.
+@@ -817,9 +951,18 @@ bool GenerateFma(Emitter& e) {
+ 	if (!e.ok) {
+ 		return false;
+ 	}
+-	const int64_t room = 128;
++	// t3 and t4 are t2 when the form does not need them: save each register once.
++	std::array<int, 4> saved {t1, t2};
++	int                saved_count = 2;
++	for (int t: {t3, t4}) {
++		if (t != t2) {
++			saved[saved_count++] = t;
++		}
++	}
++	const std::span<const int> saved_regs(saved.data(), saved_count);
++	const int64_t              room = 32 * saved_count;
+ 	e.Reserve(room);
+-	e.SaveVectors({t1, t2, t3, t4});
++	e.SaveVectors(saved_regs);
+ 
+ 	// How the double-precision work is done: 4 doubles (packed single, 256-bit packed double),
+ 	// 2 doubles (128-bit packed double) or one (scalar).
+@@ -950,7 +1093,7 @@ bool GenerateFma(Emitter& e) {
+ 		e.g.vmovsd(Xbyak::Xmm(d), Xbyak::Xmm(d), Xbyak::Xmm(t1));
+ 	}
+ 
+-	e.RestoreVectors({t1, t2, t3, t4});
++	e.RestoreVectors(saved_regs);
+ 	e.Release(room);
+ 	return e.ok;
+ }
+diff --git a/src/loader/jaguarCompat.h b/src/loader/jaguarCompat.h
+--- a/src/loader/jaguarCompat.h
++++ b/src/loader/jaguarCompat.h
+@@ -22,6 +22,11 @@ bool Enabled();
+ // instructions at load time, make them fault, so that every one goes through the run-time path.
+ bool TrapTest();
+ 
++// FMA replacements: by default single precision is computed in double precision, which is the
++// fused result except in very rare cases. KYTY_JAGUAR_FMA=fast makes every FMA a multiply and an
++// add at its own precision, each rounded, as code built without FMA would compute it: several
++// times cheaper, but results can differ from the PS5's (most where the sum cancels).
++
+ // Whether the instruction needs AVX2, FMA, BMI2 or another extension the PS4's CPU lacks
+ // (RDRAND, RDSEED, ADX, CLFLUSHOPT).
+ bool IsMissing(const ZydisDecodedInstruction& instruction);
