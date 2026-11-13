@@ -25,9 +25,12 @@
 #ifdef _WIN32
 #include <windows.h>
 #else
+#include <asm/prctl.h>
 #include <csetjmp>
 #include <csignal>
 #include <sys/mman.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 #endif
 
 using namespace Xbyak::util;
@@ -255,6 +258,26 @@ struct Instance {
 	std::string          form;
 };
 
+// The base of a form's FS or GS segment (0 for a form without one), so its memory operand can be
+// aimed at the test's data. False where this thread's base is unknown.
+static bool SegmentBase(const std::string& form, uint64_t* base) {
+	*base = 0;
+	const bool fs = form.find("fs:") != std::string::npos;
+	const bool gs = form.find("gs:") != std::string::npos;
+	if (!fs && !gs) {
+		return true;
+	}
+#ifdef _WIN32
+	// GS is the TEB; 64-bit Windows leaves FS flat (base 0).
+	if (gs) {
+		*base = reinterpret_cast<uint64_t>(NtCurrentTeb());
+	}
+	return true;
+#else
+	return syscall(SYS_arch_prctl, fs ? ARCH_GET_FS : ARCH_GET_GS, base) == 0;
+#endif
+}
+
 static std::string FormOf(const ZydisDecodedInstruction& in, const ZydisDecodedOperand* ops) {
 	std::string s = ZydisMnemonicGetString(in.mnemonic);
 	for (int i = 0; i < in.operand_count_visible; ++i) {
@@ -264,6 +287,9 @@ static std::string FormOf(const ZydisDecodedInstruction& in, const ZydisDecodedO
 			const auto c = ZydisRegisterGetClass(o.reg.value);
 			s += c == ZYDIS_REGCLASS_YMM ? "y" : c == ZYDIS_REGCLASS_XMM ? "x" : "r" + std::to_string(o.size);
 		} else if (o.type == ZYDIS_OPERAND_TYPE_MEMORY) {
+			if (o.mem.segment == ZYDIS_REGISTER_FS || o.mem.segment == ZYDIS_REGISTER_GS) {
+				s += o.mem.segment == ZYDIS_REGISTER_FS ? "fs:" : "gs:";
+			}
 			s += "m" + std::to_string(o.size);
 		} else {
 			s += "i";
@@ -363,9 +389,16 @@ int main(int argc, char** argv) {
 	State                state0 {}, state1 {};
 	std::map<std::string, Result> results;
 	long total_instances = 0;
+	long segment_skipped = 0;
 
 	for (auto& [form, instances]: forms) {
 		if (only != nullptr && form.find(only) == std::string::npos) {
+			continue;
+		}
+		// FS/GS forms: the operand's offset is aimed at the data minus the segment's base.
+		uint64_t segment_base = 0;
+		if (!SegmentBase(form, &segment_base)) {
+			++segment_skipped;
 			continue;
 		}
 		auto& result = results[form];
@@ -400,6 +433,11 @@ int main(int argc, char** argv) {
 			}
 			if (mem >= 0 && ops[mem].mem.base == ZYDIS_REGISTER_NONE) {
 				continue; // Absolute address.
+			}
+			if (segment_base != 0 && mem >= 0 && (ops[mem].mem.base == ZYDIS_REGISTER_RIP ||
+			                          ops[mem].mem.base == ZYDIS_REGISTER_RSP ||
+			                          ops[mem].mem.base == ops[mem].mem.index)) {
+				continue; // Not aimed through a segment's base here.
 			}
 			++total_instances;
 			const uint64_t data_target  = reinterpret_cast<uint64_t>(g_data) + AreaSize / 2;
@@ -577,17 +615,19 @@ int main(int argc, char** argv) {
 						                              ZYDIS_MACHINE_MODE_LONG_64, m.index));
 						const int64_t scale = index < 0 ? 0 : m.scale;
 						const int64_t disp  = m.disp.value;
+						// The offset that, with the segment's base, addresses data_target.
+						const uint64_t target = data_target - segment_base;
 						if (base == 4) {
 							if (index >= 0) {
 								s.gpr[index] = (64 / scale) * (rng() % 4);
 							}
 						} else if (index == base) {
-							s.gpr[base] = (data_target - disp) / (1 + scale);
+							s.gpr[base] = (target - disp) / (1 + scale);
 						} else {
 							if (index >= 0) {
 								s.gpr[index] = (64 / scale) * (rng() % 4);
 							}
-							s.gpr[base] = data_target - disp - (index >= 0 ? s.gpr[index] * scale : 0);
+							s.gpr[base] = target - disp - (index >= 0 ? s.gpr[index] * scale : 0);
 						}
 					}
 					for (auto& b: data0) {
@@ -626,6 +666,11 @@ int main(int argc, char** argv) {
 						result.faults++;
 						break;
 					}
+					// RDRAND/RDSEED may have no value ready (CF = 0), RDSEED above all while other
+					// processes draw on it. The replacement always has one, so the run proves nothing.
+					if (random_reg >= 0 && (state0.flags & 1) == 0) {
+						continue;
+					}
 					result.runs++;
 					std::string why;
 					// Fast FMA: the destination against multiply-then-add from this run's inputs.
@@ -646,7 +691,7 @@ int main(int argc, char** argv) {
 									return s.gpr[ZydisRegisterGetId(ZydisRegisterGetLargestEnclosing(
 									    ZYDIS_MACHINE_MODE_LONG_64, r))];
 								};
-								address = gpr(o.mem.base) + o.mem.disp.value +
+								address = segment_base + gpr(o.mem.base) + o.mem.disp.value +
 								          (o.mem.index == ZYDIS_REGISTER_NONE
 								               ? 0
 								               : gpr(o.mem.index) * o.mem.scale);
@@ -783,5 +828,9 @@ int main(int argc, char** argv) {
 	       "inexact FMA lanes: %ld\n",
 	       results.size(), forms_ok, forms_bad, total_instances, in_place_total, runs_total,
 	       inexact_total);
+	if (segment_skipped != 0) {
+		printf("skipped: %ld forms with a segment whose base this host does not expose\n",
+		       segment_skipped);
+	}
 	return forms_bad == 0 ? 0 : 1;
 }
