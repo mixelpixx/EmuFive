@@ -1,0 +1,61 @@
+From: mixelpixx <11727006+mixelpixx@users.noreply.github.com>
+Subject: [PATCH] loader: guest TSC without BMI2 on the PS4's CPU
+
+With guest TSC on, every RDTSC/RDTSCP was replaced with a sequence that
+uses RORX and MULX. The PS4's CPU has no BMI2, so the first guest RDTSC
+faulted in the trampoline, outside any module, and nothing handled it.
+
+Without BMI2 (or with KYTY_JAGUAR_COMPAT forcing the PS4 path) the
+replacement now uses SHL/OR/MUL/SHR, with RFLAGS saved below the red zone,
+and gives the same EDX:EAX.
+---
+diff --git a/src/loader/guestInstructionPatcher.cpp b/src/loader/guestInstructionPatcher.cpp
+--- a/src/loader/guestInstructionPatcher.cpp
++++ b/src/loader/guestInstructionPatcher.cpp
+@@ -986,21 +986,40 @@ void CollectAmdInstructions(const DecodedFunction&                   function,
+ }
+ 
+ // RDTSC/RDTSCP at the guest rate: EDX:EAX = host TSC * multiplier >> 32 with the upper halves of
+-// RAX and RDX zeroed; RDTSCP still sets ECX. The BMI2 sequence keeps RFLAGS and the stack.
++// RAX and RDX zeroed; RDTSCP still sets ECX. Both sequences keep RFLAGS and the red zone.
+ void GenerateReadTimeStampCounter(const DecodedCodeInstruction& decoded, u64 multiplier,
+                                   Xbyak::CodeGenerator& generator) {
++	// The BMI2 sequence leaves RFLAGS alone. Without BMI2 (the PS4's CPU, or Jaguar compatibility
++	// forced on for testing), MUL and SHR change them: save them below the red zone.
++	static const bool bmi2 =
++	    Xbyak::util::Cpu().has(Xbyak::util::Cpu::tBMI2) && !JaguarCompat::Enabled();
++	if (!bmi2) {
++		generator.lea(rsp, ptr[rsp - static_cast<int>(GuestRedZoneSize)]);
++		generator.pushfq();
++	}
+ 	if (decoded.instruction.mnemonic == ZYDIS_MNEMONIC_RDTSCP) {
+ 		generator.rdtscp();
+ 	} else {
+ 		generator.rdtsc();
+ 	}
+-	generator.rorx(rdx, rdx, 32);
+-	generator.lea(rax, ptr[rax + rdx]);
++	if (bmi2) {
++		generator.rorx(rdx, rdx, 32);
++		generator.lea(rax, ptr[rax + rdx]);
++		generator.mov(rdx, multiplier);
++		generator.mulx(rdx, rax, rax);
++		generator.rorx(rax, rax, 32);
++		generator.mov(eax, eax);
++		generator.mov(edx, edx);
++		return;
++	}
++	generator.shl(rdx, 32);
++	generator.or_(rax, rdx);
+ 	generator.mov(rdx, multiplier);
+-	generator.mulx(rdx, rax, rax);
+-	generator.rorx(rax, rax, 32);
+-	generator.mov(eax, eax);
++	generator.mul(rdx); // RDX:RAX = TSC * multiplier.
++	generator.shr(rax, 32);
+ 	generator.mov(edx, edx);
++	generator.popfq();
++	generator.lea(rsp, ptr[rsp + static_cast<int>(GuestRedZoneSize)]);
+ }
+ 
+ void CollectTscInstructions(const DecodedFunction&                   function,

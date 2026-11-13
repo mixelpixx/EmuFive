@@ -1,0 +1,252 @@
+From: mixelpixx <11727006+mixelpixx@users.noreply.github.com>
+Subject: [PATCH] loader: PS4 CPU: rewrite AVX2 instructions with a same-length AVX twin in place
+
+Every AVX2 instruction went through a trampoline, even when AVX has an
+instruction that does the same thing in the same number of bytes. At load
+time, before the code runs, these are now rewritten in the guest code
+itself and decoded again (so a span relocated for a neighbour copies the
+new instruction):
+
+  VPAND/VPANDN/VPOR/VPXOR ymm  -> VANDPD/VANDNPD/VORPD/VXORPD (opcode)
+  VPBLENDD                     -> VBLENDPS
+  VPERM2I128                   -> VPERM2F128
+  VEXTRACTI128/VINSERTI128     -> VEXTRACTF128/VINSERTF128
+  VBROADCASTI128               -> VBROADCASTF128
+  VPBROADCASTD x/ymm, m32      -> VBROADCASTSS
+  VPBROADCASTQ ymm, m64        -> VBROADCASTSD
+  VPMASKMOVD/Q                 -> VMASKMOVPS/PD (W0)
+  VMOVNTDQA ymm, m256          -> VMOVDQA (map 0F; no non-temporal hint)
+  VPERMQ/VPERMPD, halves imm   -> VPERM2F128 ymm, ymm0, src, imm (W0)
+  VPSHUFD ymm (C4 VEX only)    -> VPERMILPS ymm, src, imm (map 0F3A, W0)
+
+The first byte never changes, which keeps the rule of the 4-byte relay
+sites. The rewrite also works in functions with indirect branches, where
+relocation is not possible. It is not done at run time: a thread that
+already faulted on the old bytes would find an instruction that is not
+missing.
+
+The trampoline and run-time paths use the same single AVX instruction for
+VPAND/VPANDN/VPOR/VPXOR and VPSHUFD ymm instead of the 128-bit lane split.
+
+The load log now says how many were rewritten in place.
+---
+diff --git a/src/loader/guestInstructionPatcher.cpp b/src/loader/guestInstructionPatcher.cpp
+--- a/src/loader/guestInstructionPatcher.cpp
++++ b/src/loader/guestInstructionPatcher.cpp
+@@ -1118,6 +1118,38 @@ bool RunsOnJaguar(const ZydisDecodedInstruction& instruction) {
+ 	}
+ }
+ 
++// Rewrites the instructions JaguarCompat::RewriteInPlace has a same-length twin for in the guest
++// code itself (nothing runs there yet) and decodes them again, so that a span relocated for a
++// neighbour copies the new instruction.
++void RewriteJaguarInPlace(DecodedFunction& function, GuestInstructionPatchResult& result) {
++	for (auto& [address, decoded]: function.instructions) {
++		if (!JaguarCompat::IsMissing(decoded.instruction)) {
++			continue;
++		}
++		auto*                                        code = reinterpret_cast<u8*>(address);
++		std::array<u8, ZYDIS_MAX_INSTRUCTION_LENGTH> bytes {};
++		if (!JaguarCompat::RewriteInPlace(decoded.instruction, decoded.operands.data(), code,
++		                                  bytes.data())) {
++			continue;
++		}
++		ZydisDecodedInstruction                                  instruction {};
++		std::array<ZydisDecodedOperand, ZYDIS_MAX_OPERAND_COUNT> operands {};
++		if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(&GetDecoder(), bytes.data(),
++		                                         decoded.instruction.length, &instruction,
++		                                         operands.data())) ||
++		    instruction.length != decoded.instruction.length ||
++		    JaguarCompat::IsMissing(instruction)) {
++			continue;
++		}
++		std::memcpy(code, bytes.data(), instruction.length);
++		decoded.instruction = instruction;
++		decoded.operands    = operands;
++		++result.jaguar.found;
++		++result.jaguar.native;
++		++result.jaguar_in_place;
++	}
++}
++
+ void CollectJaguarInstructions(const DecodedFunction&                   function,
+                                std::map<uintptr_t, InstructionRewrite>& rewrite_sites,
+                                GuestInstructionPatchResult&             result) {
+@@ -1786,6 +1818,9 @@ GuestInstructionPatchResult PatchGuestInstructions(u64 segment_addr, u64 segment
+ 
+ 		++result.function_count;
+ 		auto function = DecodeFunction(function_start, function_end, segment_addr, segment_end);
++		if (emulate_jaguar && !JaguarCompat::TrapTest()) {
++			RewriteJaguarInPlace(function, result);
++		}
+ 		if (analyze_red_zone) {
+ 			AnalyzeRedZoneLiveness(function);
+ 		}
+diff --git a/src/loader/guestInstructionPatcher.h b/src/loader/guestInstructionPatcher.h
+--- a/src/loader/guestInstructionPatcher.h
++++ b/src/loader/guestInstructionPatcher.h
+@@ -53,6 +53,7 @@ struct GuestInstructionPatchResult {
+ 	InstructionPatchCounts clwb;
+ 	InstructionPatchCounts rdtsc;
+ 	InstructionPatchCounts jaguar;
++	uint64_t               jaguar_in_place = 0; // Of jaguar.native: rewritten without a trampoline.
+ };
+ 
+ void RegisterGuestInstructionPatchModule(void* module_ptr, uint64_t module_size,
+diff --git a/src/loader/jaguarCompat.cpp b/src/loader/jaguarCompat.cpp
+--- a/src/loader/jaguarCompat.cpp
++++ b/src/loader/jaguarCompat.cpp
+@@ -1466,6 +1466,13 @@ bool Generate(const ZydisDecodedInstruction& instruction, const ZydisDecodedOper
+ 		return GenerateFma(e);
+ 	}
+ 	switch (instruction.mnemonic) {
++		// Bitwise, so the floating-point forms give the same bits.
++		case ZYDIS_MNEMONIC_VPAND: return GenerateRenamed(e, ZYDIS_MNEMONIC_VANDPD);
++		case ZYDIS_MNEMONIC_VPANDN: return GenerateRenamed(e, ZYDIS_MNEMONIC_VANDNPD);
++		case ZYDIS_MNEMONIC_VPOR: return GenerateRenamed(e, ZYDIS_MNEMONIC_VORPD);
++		case ZYDIS_MNEMONIC_VPXOR: return GenerateRenamed(e, ZYDIS_MNEMONIC_VXORPD);
++		// The same dword selection in each 128-bit half.
++		case ZYDIS_MNEMONIC_VPSHUFD: return GenerateRenamed(e, ZYDIS_MNEMONIC_VPERMILPS);
+ 		case ZYDIS_MNEMONIC_VEXTRACTI128: return GenerateRenamed(e, ZYDIS_MNEMONIC_VEXTRACTF128);
+ 		case ZYDIS_MNEMONIC_VINSERTI128: return GenerateRenamed(e, ZYDIS_MNEMONIC_VINSERTF128);
+ 		case ZYDIS_MNEMONIC_VPERM2I128: return GenerateRenamed(e, ZYDIS_MNEMONIC_VPERM2F128);
+@@ -1508,4 +1515,96 @@ bool Generate(const ZydisDecodedInstruction& instruction, const ZydisDecodedOper
+ 	return false;
+ }
+ 
++bool RewriteInPlace(const ZydisDecodedInstruction& instruction, const ZydisDecodedOperand* operands,
++                    const uint8_t* code, uint8_t* out) {
++	if (instruction.encoding != ZYDIS_INSTRUCTION_ENCODING_VEX || !IsMissing(instruction)) {
++		return false;
++	}
++	const int vex    = instruction.raw.vex.offset;
++	const int opcode = vex + instruction.raw.vex.size;
++	const int imm    = instruction.raw.imm[0].offset;
++	const bool three = instruction.raw.vex.size == 3; // C4: map in byte 1, W in byte 2.
++	const bool wide  = instruction.raw.vex.L != 0;
++	const bool from_memory =
++	    instruction.operand_count_visible >= 2 && operands[1].type == ZYDIS_OPERAND_TYPE_MEMORY;
++	std::copy_n(code, instruction.length, out);
++	const auto set_map = [&](uint8_t map) { out[vex + 1] = (out[vex + 1] & 0xe0) | map; };
++	const auto clear_w = [&] { out[vex + 2] &= 0x7f; };
++	uint8_t    new_opcode = 0;
++	switch (instruction.mnemonic) {
++		// VEX.66.0F, keeping pp = 66: bitwise, so the PD forms give the same bits.
++		case ZYDIS_MNEMONIC_VPAND: new_opcode = 0x54; break;  // VANDPD
++		case ZYDIS_MNEMONIC_VPANDN: new_opcode = 0x55; break; // VANDNPD
++		case ZYDIS_MNEMONIC_VPOR: new_opcode = 0x56; break;   // VORPD
++		case ZYDIS_MNEMONIC_VPXOR: new_opcode = 0x57; break;  // VXORPD
++		// VEX.66.0F3A, W0.
++		case ZYDIS_MNEMONIC_VPBLENDD: new_opcode = 0x0c; break;     // VBLENDPS
++		case ZYDIS_MNEMONIC_VPERM2I128: new_opcode = 0x06; break;   // VPERM2F128
++		case ZYDIS_MNEMONIC_VEXTRACTI128: new_opcode = 0x19; break; // VEXTRACTF128
++		case ZYDIS_MNEMONIC_VINSERTI128: new_opcode = 0x18; break;  // VINSERTF128
++		// VEX.66.0F38, W0.
++		case ZYDIS_MNEMONIC_VBROADCASTI128: new_opcode = 0x1a; break; // VBROADCASTF128
++		case ZYDIS_MNEMONIC_VPBROADCASTD:
++			// VBROADCASTSS from memory (its register form is AVX2 too).
++			if (!from_memory) {
++				return false;
++			}
++			new_opcode = 0x18;
++			break;
++		case ZYDIS_MNEMONIC_VPBROADCASTQ:
++			// VBROADCASTSD: from memory, and only into a YMM register.
++			if (!from_memory || !wide) {
++				return false;
++			}
++			new_opcode = 0x19;
++			break;
++		case ZYDIS_MNEMONIC_VPMASKMOVD: // VMASKMOVPS load (2C) or store (2E).
++			new_opcode = instruction.opcode == 0x8c ? 0x2c : 0x2e;
++			break;
++		case ZYDIS_MNEMONIC_VPMASKMOVQ: // VMASKMOVPD load (2D) or store (2F), W0.
++			new_opcode = instruction.opcode == 0x8c ? 0x2d : 0x2f;
++			clear_w();
++			break;
++		case ZYDIS_MNEMONIC_VMOVNTDQA:
++			// VMOVDQA ymm, m256 (VEX.66.0F 6F): the same 32-byte alignment rule, without the
++			// non-temporal hint.
++			set_map(1);
++			new_opcode = 0x6f;
++			break;
++		case ZYDIS_MNEMONIC_VPERMQ:
++		case ZYDIS_MNEMONIC_VPERMPD: {
++			// VPERM2F128 ymm, ymm0, source, imm (VEX.66.0F3A.W0 06) when the immediate moves
++			// whole 128-bit halves: VPERMQ's VEX.vvvv is 1111b (YMM0), which the new immediate
++			// does not select. Each half takes the source's low (2) or high (3) half.
++			const uint8_t q = out[imm];
++			uint8_t       halves[2];
++			for (int half = 0; half < 2; ++half) {
++				const int first  = (q >> (half * 4)) & 3;
++				const int second = (q >> (half * 4 + 2)) & 3;
++				if ((first != 0 && first != 2) || second != first + 1) {
++					return false;
++				}
++				halves[half] = first == 0 ? 2 : 3;
++			}
++			clear_w();
++			new_opcode = 0x06;
++			out[imm]   = static_cast<uint8_t>(halves[0] | halves[1] << 4);
++			break;
++		}
++		case ZYDIS_MNEMONIC_VPSHUFD:
++			// VPERMILPS ymm, source, imm (VEX.66.0F3A.W0 04) selects the same way in each half.
++			// The two-byte VEX (C5) has no map field, and VPERMILPS needs the three-byte one.
++			if (!three) {
++				return false;
++			}
++			set_map(3);
++			clear_w();
++			new_opcode = 0x04;
++			break;
++		default: return false;
++	}
++	out[opcode] = new_opcode;
++	return true;
++}
++
+ } // namespace Loader::JaguarCompat
+diff --git a/src/loader/jaguarCompat.h b/src/loader/jaguarCompat.h
+--- a/src/loader/jaguarCompat.h
++++ b/src/loader/jaguarCompat.h
+@@ -34,6 +34,14 @@ bool IsMissing(const ZydisDecodedInstruction& instruction);
+ bool Generate(const ZydisDecodedInstruction& instruction, const ZydisDecodedOperand* operands,
+               uint64_t address, Xbyak::CodeGenerator& generator, bool flags_live);
+ 
++// For an instruction IsMissing reports that has an AVX twin of the same length and the same
++// operand bytes (VPAND ymm and VANDPD, VPBLENDD and VBLENDPS, VPERMQ that moves whole halves and
++// VPERM2F128, ...): writes the twin's bytes to `out` (instruction.length bytes, from the original
++// bytes at `code`) and returns true. The first byte stays the same. Meant for load time, before the
++// code runs: a thread that already faulted on the old bytes would find a different instruction.
++bool RewriteInPlace(const ZydisDecodedInstruction& instruction, const ZydisDecodedOperand* operands,
++                    const uint8_t* code, uint8_t* out);
++
+ } // namespace Loader::JaguarCompat
+ 
+ #endif /* KYTY_LOADER_JAGUAR_COMPAT_H_ */
+diff --git a/src/loader/runtimeLinker.cpp b/src/loader/runtimeLinker.cpp
+--- a/src/loader/runtimeLinker.cpp
++++ b/src/loader/runtimeLinker.cpp
+@@ -1876,6 +1876,7 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
+ 			totals.clwb += result.clwb;
+ 			totals.rdtsc += result.rdtsc;
+ 			totals.jaguar += result.jaguar;
++			totals.jaguar_in_place += result.jaguar_in_place;
+ 			if (protect_memory_faults) {
+ 				LOGF("Windows guest red-zone patching: %s, functions=%" PRIu64 ", red_zone=%" PRIu64
+ 				     ", memory=%" PRIu64 ", patched=%" PRIu64 ", short=%" PRIu64 ", stack=%" PRIu64
+@@ -1897,9 +1898,10 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
+ 		if (emulate_jaguar && have_function_starts) {
+ 			const auto& counts = totals.jaguar;
+ 			Log::WriteToConsoleAndLog(fmt::format(
+-			    "PS4 CPU compatibility: {} AVX2/FMA/BMI2 instructions: {} found, {} rewritten, {} "
+-			    "replaced when first run\n",
+-			    module_name, counts.found, counts.native, counts.found - counts.native));
++			    "PS4 CPU compatibility: {} instructions the CPU lacks (AVX2, FMA, BMI2 and others): {} "
++			    "found, {} rewritten ({} in place), {} replaced when first run\n",
++			    module_name, counts.found, counts.native, totals.jaguar_in_place,
++			    counts.found - counts.native));
+ 		}
+ 		if (emulate_amd && have_function_starts) {
+ 			InstructionPatchCounts combined {};

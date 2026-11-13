@@ -1,0 +1,119 @@
+From: mixelpixx <11727006+mixelpixx@users.noreply.github.com>
+Subject: [PATCH] loader: PS4 CPU replacements for PDEP, PEXT and 256-bit VMPSADBW
+
+These three had no replacement: a game that used one faulted with nothing
+to handle it.
+
+- PDEP/PEXT take one step per set bit of the mask, lowest first, with
+  BMI1's BLSI/BLSR (the PS4's CPU has BMI1), and keep RFLAGS when they are
+  still read, like the originals.
+- VMPSADBW ymm runs as two 128-bit halves like the other lane-wise
+  instructions, with imm8[2:0] for the lower half and imm8[5:3] for the
+  upper one.
+
+An instruction with no replacement is now reported once when its module
+loads, instead of only when it faults.
+---
+diff --git a/src/loader/guestInstructionPatcher.cpp b/src/loader/guestInstructionPatcher.cpp
+--- a/src/loader/guestInstructionPatcher.cpp
++++ b/src/loader/guestInstructionPatcher.cpp
+@@ -1222,6 +1222,18 @@ void RelocateGuestInstructions(PatchModule* module, const DecodedFunction& funct
+ 						encoded = JaguarCompat::Generate(decoded->instruction,
+ 						                                 decoded->operands.data(), decoded->address,
+ 						                                 generator, rewrite->second.flags_live);
++						if (!encoded && Xbyak::GetError() == 0) {
++							// Left in place, it faults and the run-time path has nothing either:
++							// say so once per instruction before that happens.
++							static std::bitset<ZYDIS_MNEMONIC_MAX_VALUE + 1> reported;
++							if (!reported.test(decoded->instruction.mnemonic)) {
++								reported.set(decoded->instruction.mnemonic);
++								std::printf("PS4 CPU compatibility: no replacement for %s (first at "
++								            "%p)\n",
++								            ZydisMnemonicGetString(decoded->instruction.mnemonic),
++								            reinterpret_cast<void*>(decoded->address));
++							}
++						}
+ 					} else {
+ 						// CLFLUSH writes back dirty data too; invalidation is a permitted stronger
+ 						// action.
+diff --git a/src/loader/jaguarCompat.cpp b/src/loader/jaguarCompat.cpp
+--- a/src/loader/jaguarCompat.cpp
++++ b/src/loader/jaguarCompat.cpp
+@@ -318,7 +318,8 @@ bool IsLaneWise(ZydisMnemonic mnemonic) {
+ 		case ZYDIS_MNEMONIC_VPSRAD:
+ 		case ZYDIS_MNEMONIC_VPSLLDQ:
+ 		case ZYDIS_MNEMONIC_VPSRLDQ:
+-		case ZYDIS_MNEMONIC_VMOVNTDQA: return true;
++		case ZYDIS_MNEMONIC_VMOVNTDQA:
++		case ZYDIS_MNEMONIC_VMPSADBW: return true;
+ 		default: return false;
+ 	}
+ }
+@@ -382,7 +383,14 @@ bool GenerateLaneWise(Emitter& e) {
+ 			case Kind::SplitRegister:
+ 				return RegOp(XmmReg(upper ? sources[i].scratch : sources[i].reg));
+ 			case Kind::SplitMemory: return e.Mem(i, upper ? 16 : 0, 16);
+-			default: return e.Copy(i);
++			default:
++				// VMPSADBW ymm: the lower half's offsets are imm8[2:0], the upper half's imm8[5:3].
++				if (e.in.mnemonic == ZYDIS_MNEMONIC_VMPSADBW &&
++				    e.ops[i].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
++					const uint64_t imm = e.ops[i].imm.value.u;
++					return ImmOp(upper ? (imm >> 3) & 7 : imm & 7);
++				}
++				return e.Copy(i);
+ 		}
+ 	};
+ 	for (bool upper: {true, false}) {
+@@ -1137,7 +1145,7 @@ public:
+ private:
+ 	Emitter&                     e;
+ 	bool                         save_flags;
+-	std::array<ZydisRegister, 3> saved {};
++	std::array<ZydisRegister, 5> saved {};
+ 	int                          count = 0;
+ };
+ 
+@@ -1209,6 +1217,42 @@ bool GenerateBmi2(Emitter& e, bool flags_live) {
+ 			w.Finish();
+ 			return e.ok;
+ 		}
++		case ZYDIS_MNEMONIC_PDEP:
++		case ZYDIS_MNEMONIC_PEXT: {
++			// PDEP/PEXT destination, source, mask: one step per set bit of the mask, lowest
++			// first (BMI1 BLSI/BLSR), with `bit` walking the packed side from bit 0. PDEP puts
++			// source bit `bit` at the mask bit; PEXT puts the source bit at the mask bit into
++			// `bit`. Like the originals, they keep RFLAGS (when still read).
++			const bool deposit = e.in.mnemonic == ZYDIS_MNEMONIC_PDEP;
++			GprWork    w(e,
++			             {ZYDIS_REGISTER_RAX, ZYDIS_REGISTER_RCX, ZYDIS_REGISTER_RDX, ZYDIS_REGISTER_R8,
++			              ZYDIS_REGISTER_R9},
++			             flags_live);
++			// The mask (register or memory) first, while the guest registers that may address it
++			// are unchanged; it is zero-extended and consumed bit by bit.
++			w.Read(ZYDIS_REGISTER_RDX, 2, bits);
++			w.Read(ZYDIS_REGISTER_RAX, 1, bits); // Source (a register).
++			Xbyak::Label next;
++			Xbyak::Label skip;
++			Xbyak::Label done;
++			e.g.xor_(ecx, ecx); // Result.
++			e.g.mov(r8d, 1);    // Bit on the packed side.
++			e.g.L(next);
++			e.g.test(rdx, rdx);
++			e.g.jz(done);
++			e.g.blsi(r9, rdx); // Lowest mask bit still to do.
++			e.g.test(rax, deposit ? r8 : r9);
++			e.g.jz(skip);
++			e.g.or_(rcx, deposit ? r9 : r8);
++			e.g.L(skip);
++			e.g.add(r8, r8);
++			e.g.blsr(rdx, rdx);
++			e.g.jmp(next);
++			e.g.L(done);
++			w.Write(0, ZYDIS_REGISTER_RCX, bits);
++			w.Finish();
++			return e.ok;
++		}
+ 		case ZYDIS_MNEMONIC_BZHI: {
+ 			// Sets ZF and SF from the result, CF when the index is past the operand, OF = 0.
+ 			GprWork      w(e, {ZYDIS_REGISTER_RAX, ZYDIS_REGISTER_RCX, ZYDIS_REGISTER_RDX}, false);

@@ -1,0 +1,87 @@
+From: mixelpixx <11727006+mixelpixx@users.noreply.github.com>
+Subject: [PATCH] loader: PS4 CPU run-time path: lock the module list, no traps in trampolines
+
+RedirectJaguarInstruction ran under a signal on any guest thread while the
+loader could register or unregister modules on another, so the module map
+could be read in the middle of an insert or erase. Guard it with a
+shared_mutex: the handler takes it shared for its whole run, register and
+unregister take it exclusively.
+
+When a span ran out of trampoline space, the retry turned AVX2/FMA/BMI2
+replacements into traps: a raw copy of the instruction in the trampoline.
+That copy faults outside [module->start, module->end), where the handler
+does not look, so the guest crashed. Jaguar replacements are never traps
+now; a span that does not fit stays in place and the instruction is
+replaced when it first runs.
+---
+diff --git a/src/loader/guestInstructionPatcher.cpp b/src/loader/guestInstructionPatcher.cpp
+--- a/src/loader/guestInstructionPatcher.cpp
++++ b/src/loader/guestInstructionPatcher.cpp
+@@ -20,6 +20,7 @@
+ #include <map>
+ #include <memory>
+ #include <mutex>
++#include <shared_mutex>
+ #include <optional>
+ #include <set>
+ #include <unordered_set>
+@@ -89,6 +90,10 @@ struct PatchModule {
+ };
+ 
+ static std::map<u64, PatchModule> g_patch_modules;
++// The PS4 CPU compatibility fault handler looks modules up on any guest thread while another
++// thread may load or unload one: it holds this shared for as long as it uses the module, and
++// registering or unregistering a module (which destroys its PatchModule) holds it exclusively.
++static std::shared_mutex g_patch_modules_mutex;
+ 
+ static PatchModule* GetContainingModule(const void* ptr) {
+ 	auto upper = g_patch_modules.upper_bound(reinterpret_cast<u64>(ptr));
+@@ -185,13 +190,15 @@ InstructionPatchCounts& ReplacementCounts(GuestInstructionPatchResult& result,
+ }
+ 
+ bool UsesInstructionTrap(InstructionReplacement replacement, bool trap_replacements) {
+-	// RDTSC does not fault, so a trap fallback would keep the host rate.
++	// RDTSC does not fault, so a trap fallback would keep the host rate. A Jaguar instruction
++	// copied into the trampoline would fault there, outside the module, where
++	// RedirectJaguarInstruction does not look: one whose replacement does not fit is left in
++	// place instead (its span is not relocated) and replaced when it first runs.
+ 	return replacement != InstructionReplacement::None &&
+ 	       replacement != InstructionReplacement::ReadTimeStampCounter &&
++	       replacement != InstructionReplacement::Jaguar &&
+ 	       (trap_replacements || replacement == InstructionReplacement::InsertQ ||
+ 	        replacement == InstructionReplacement::ReadProcessorId);
+-	// Jaguar: a trapped instruction keeps its bytes and faults; RedirectJaguarInstruction
+-	// then runs its replacement.
+ }
+ 
+ bool IsStackPointerRegister(ZydisRegister reg) {
+@@ -1989,8 +1996,9 @@ bool RedirectJaguarInstruction(void* native_context) {
+ 	if (native_context == nullptr || !JaguarCompat::Enabled()) {
+ 		return false;
+ 	}
+-	u64&  rip    = GuestRip(native_context);
+-	auto* module = GetContainingModule(reinterpret_cast<void*>(rip));
++	u64&              rip = GuestRip(native_context);
++	std::shared_lock  modules_lock {g_patch_modules_mutex};
++	auto*             module = GetContainingModule(reinterpret_cast<void*>(rip));
+ 	if (module == nullptr || module->fallback_size == 0) {
+ 		return false;
+ 	}
+@@ -2198,7 +2206,8 @@ void RegisterGuestInstructionPatchModule(void* module_ptr, uint64_t module_size,
+                                          void* trampoline_area_ptr, uint64_t trampoline_area_size) {
+ 	EXIT_IF(module_ptr == nullptr || module_size == 0 || trampoline_area_ptr == nullptr ||
+ 	        trampoline_area_size == 0);
+-	const auto module_addr = reinterpret_cast<u64>(module_ptr);
++	const auto       module_addr = reinterpret_cast<u64>(module_ptr);
++	std::unique_lock lock {g_patch_modules_mutex};
+ 	g_patch_modules.erase(module_addr);
+ 	g_patch_modules.emplace(std::piecewise_construct, std::forward_as_tuple(module_addr),
+ 	                        std::forward_as_tuple(static_cast<u8*>(module_ptr), module_size,
+@@ -2207,6 +2216,7 @@ void RegisterGuestInstructionPatchModule(void* module_ptr, uint64_t module_size,
+ }
+ 
+ void UnregisterGuestInstructionPatchModule(void* module_ptr) {
++	std::unique_lock lock {g_patch_modules_mutex};
+ 	g_patch_modules.erase(reinterpret_cast<u64>(module_ptr));
+ }
+ 
