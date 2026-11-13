@@ -10,17 +10,23 @@
 #include <Zydis/Zydis.h>
 #include <algorithm>
 #include <cmath>
-#include <csetjmp>
-#include <csignal>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <iterator>
 #include <map>
 #include <random>
 #include <string>
-#include <sys/mman.h>
 #include <vector>
 #include <xbyak/xbyak.h>
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <csetjmp>
+#include <csignal>
+#include <sys/mman.h>
+#endif
 
 using namespace Xbyak::util;
 
@@ -36,7 +42,21 @@ constexpr size_t AreaSize  = 64 * 1024;
 constexpr size_t CodeSize  = 1024 * 1024;
 constexpr uint64_t Status  = 0x8d5; // CF PF AF ZF SF OF
 
+// Everything is mapped below 2 GB: the runners address the state with 32-bit displacements.
 static uint8_t* Map(size_t size) {
+#ifdef _WIN32
+	static uintptr_t next = 0x10000000;
+	for (; next < 0x7ff00000; next += 0x100000) {
+		void* p = VirtualAlloc(reinterpret_cast<void*>(next), size, MEM_RESERVE | MEM_COMMIT,
+		                       PAGE_EXECUTE_READWRITE);
+		if (p != nullptr) {
+			next += (size + 0xfffff) & ~uintptr_t {0xfffff};
+			return static_cast<uint8_t*>(p);
+		}
+	}
+	fprintf(stderr, "VirtualAlloc: no room below 2 GB\n");
+	exit(1);
+#else
 	void* p = mmap(nullptr, size, PROT_READ | PROT_WRITE | PROT_EXEC,
 	               MAP_PRIVATE | MAP_ANONYMOUS | MAP_32BIT, -1, 0);
 	if (p == MAP_FAILED) {
@@ -44,6 +64,7 @@ static uint8_t* Map(size_t size) {
 		exit(1);
 	}
 	return static_cast<uint8_t*>(p);
+#endif
 }
 
 static State*   g_state;
@@ -52,15 +73,66 @@ static uint8_t* g_stack;
 static uint8_t* g_native_code;
 static uint8_t* g_repl_code;
 
-static sigjmp_buf g_jump;
 static volatile int g_signal;
+#ifdef _WIN32
+// A fault in the code under test resumes at g_recover with the runner's own stack, which
+// restores the host registers and returns as the runner would.
+static uint8_t* g_recover;
+static LONG CALLBACK OnException(PEXCEPTION_POINTERS info) {
+	const auto rip = static_cast<uintptr_t>(info->ContextRecord->Rip);
+	const auto in  = [rip](const uint8_t* code) {
+		return rip >= reinterpret_cast<uintptr_t>(code) &&
+		       rip < reinterpret_cast<uintptr_t>(code) + CodeSize;
+	};
+	if (!in(g_native_code) && !in(g_repl_code)) {
+		return EXCEPTION_CONTINUE_SEARCH;
+	}
+	g_signal                   = static_cast<int>(info->ExceptionRecord->ExceptionCode);
+	info->ContextRecord->Rsp   = g_state->host_rsp;
+	info->ContextRecord->Rip   = reinterpret_cast<DWORD64>(g_recover);
+	return EXCEPTION_CONTINUE_EXECUTION;
+}
+// Win64 also keeps RSI, RDI and XMM6-XMM15 for the caller.
+static const Xbyak::Reg64 g_host_saved[] = {rbx, rbp, rsi, rdi, r12, r13, r14, r15};
+constexpr int XmmSaveSize = 10 * 16;
+#else
+static sigjmp_buf g_jump;
 static void OnSignal(int sig, siginfo_t*, void*) {
 	g_signal = sig;
 	siglongjmp(g_jump, 1);
 }
+static const Xbyak::Reg64 g_host_saved[] = {rbx, rbp, r12, r13, r14, r15};
+#endif
 
 static Xbyak::Address At(const void* p) {
 	return Xbyak::util::ptr[Xbyak::RegExp(reinterpret_cast<size_t>(p))];
+}
+
+static void SaveHost(Xbyak::CodeGenerator& g) {
+	for (auto r: g_host_saved) {
+		g.push(r);
+	}
+#ifdef _WIN32
+	g.sub(rsp, XmmSaveSize);
+	for (int i = 0; i < 10; ++i) {
+		g.movdqu(ptr[rsp + i * 16], Xbyak::Xmm(6 + i));
+	}
+#endif
+}
+
+// Expects RSP as SaveHost left it.
+static void RestoreHost(Xbyak::CodeGenerator& g) {
+#ifdef _WIN32
+	for (int i = 0; i < 10; ++i) {
+		g.movdqu(Xbyak::Xmm(6 + i), ptr[rsp + i * 16]);
+	}
+	g.add(rsp, XmmSaveSize);
+#endif
+	for (int i = static_cast<int>(std::size(g_host_saved)) - 1; i >= 0; --i) {
+		g.pop(g_host_saved[i]);
+	}
+	g.vzeroupper();
+	g.ret();
 }
 
 // Loads the state, runs `body`, saves the state.
@@ -69,9 +141,7 @@ static void BuildRunner(Xbyak::CodeGenerator& g, Body body) {
 	const Xbyak::Reg64 regs[16] = {rax, rcx, rdx, rbx, rsp, rbp, rsi, rdi,
 	                               r8,  r9,  r10, r11, r12, r13, r14, r15};
 	g.reset();
-	for (auto r: {rbx, rbp, r12, r13, r14, r15}) {
-		g.push(r);
-	}
+	SaveHost(g);
 	g.mov(At(&g_state->host_rsp), rsp);
 	for (int i = 0; i < 16; ++i) {
 		g.vmovdqu(Xbyak::Ymm(i), At(g_state->ymm[i]));
@@ -95,11 +165,7 @@ static void BuildRunner(Xbyak::CodeGenerator& g, Body body) {
 	for (int i = 0; i < 16; ++i) {
 		g.vmovdqu(At(g_state->ymm[i]), Xbyak::Ymm(i));
 	}
-	for (auto r: {r15, r14, r13, r12, rbp, rbx}) {
-		g.pop(r);
-	}
-	g.vzeroupper();
-	g.ret();
+	RestoreHost(g);
 }
 
 struct Instance {
@@ -126,6 +192,7 @@ static std::string FormOf(const ZydisDecodedInstruction& in, const ZydisDecodedO
 
 struct Result {
 	long runs = 0, failures = 0, inexact = 0, faults = 0, unsupported = 0, bad_isa = 0;
+	long in_place = 0; // Instances with a same-length rewrite (also tested).
 	std::string first_failure;
 };
 
@@ -193,6 +260,14 @@ int main(int argc, char** argv) {
 	Xbyak::CodeGenerator native(CodeSize, g_native_code);
 	Xbyak::CodeGenerator repl(CodeSize, g_repl_code);
 
+#ifdef _WIN32
+	g_recover = Map(4096);
+	{
+		Xbyak::CodeGenerator recover(4096, g_recover);
+		RestoreHost(recover);
+	}
+	AddVectoredExceptionHandler(1, OnException);
+#else
 	struct sigaction sa {};
 	sa.sa_sigaction = OnSignal;
 	sa.sa_flags     = SA_SIGINFO | SA_NODEFER;
@@ -200,6 +275,7 @@ int main(int argc, char** argv) {
 	sigaction(SIGILL, &sa, nullptr);
 	sigaction(SIGBUS, &sa, nullptr);
 	sigaction(SIGFPE, &sa, nullptr);
+#endif
 
 	std::vector<uint8_t> data0(AreaSize), stack0(AreaSize), data1(AreaSize), stack1(AreaSize);
 	State                state0 {}, state1 {};
@@ -217,6 +293,16 @@ int main(int argc, char** argv) {
 			ZydisDecoderDecodeFull(&decoder, instance.bytes.data(), instance.bytes.size(), &in, ops);
 			const bool bzhi = in.mnemonic == ZYDIS_MNEMONIC_BZHI;
 			const bool fma  = in.meta.isa_ext == ZYDIS_ISA_EXT_FMA;
+			// RDRAND/RDSEED: the value is random, so the destination bits it writes are not
+			// compared (the rest of the register, the flags and everything else are).
+			int      random_reg  = -1;
+			uint64_t random_bits = 0;
+			if (in.mnemonic == ZYDIS_MNEMONIC_RDRAND || in.mnemonic == ZYDIS_MNEMONIC_RDSEED) {
+				const auto reg64 =
+				    ZydisRegisterGetLargestEnclosing(ZYDIS_MACHINE_MODE_LONG_64, ops[0].reg.value);
+				random_reg  = ZydisRegisterGetId(reg64);
+				random_bits = ops[0].size == 64 ? ~uint64_t {0} : (uint64_t {1} << ops[0].size) - 1;
+			}
 
 			// Memory operand: where it should point.
 			int mem = -1;
@@ -261,15 +347,38 @@ int main(int argc, char** argv) {
 			ZydisDecoderDecodeFull(&decoder, reinterpret_cast<void*>(native_address), 16, &placed,
 			                       placed_ops);
 
-			for (bool flags_live: {true, false}) {
-				bool     generated = true;
-				uint64_t repl_begin = 0, repl_end = 0;
+			// The replacement with RFLAGS live, then dead, then the same-length rewrite (when there
+			// is one) as the load-time patcher writes it over the original.
+			uint8_t    rewritten[16] = {};
+			const bool has_rewrite   = Loader::JaguarCompat::RewriteInPlace(
+			    placed, placed_ops, reinterpret_cast<const uint8_t*>(native_address), rewritten);
+			if (has_rewrite) {
+				result.in_place++;
+			}
+			for (int variant = 0; variant < (has_rewrite ? 3 : 2); ++variant) {
+				const bool flags_live = variant != 1;
+				const bool in_place   = variant == 2;
+				bool       generated  = true;
+				uint64_t   repl_begin = 0, repl_end = 0;
 				Xbyak::ClearError();
 				BuildRunner(repl, [&] {
 					repl_begin = reinterpret_cast<uint64_t>(repl.getCurr());
-					generated  = Loader::JaguarCompat::Generate(placed, placed_ops, native_address,
-					                                            repl, flags_live);
-					repl_end   = reinterpret_cast<uint64_t>(repl.getCurr());
+					if (in_place) {
+						// Same bytes; a RIP-relative displacement still aims at the data.
+						uint8_t bytes[16];
+						memcpy(bytes, rewritten, placed.length);
+						if (mem >= 0 && placed_ops[mem].mem.base == ZYDIS_REGISTER_RIP) {
+							int32_t disp;
+							memcpy(&disp, bytes + placed.raw.disp.offset, 4);
+							disp += static_cast<int32_t>(native_address - repl_begin);
+							memcpy(bytes + placed.raw.disp.offset, &disp, 4);
+						}
+						repl.db(bytes, placed.length);
+					} else {
+						generated = Loader::JaguarCompat::Generate(placed, placed_ops,
+						                                           native_address, repl, flags_live);
+					}
+					repl_end = reinterpret_cast<uint64_t>(repl.getCurr());
 				});
 				if (!generated || Xbyak::GetError() != 0) {
 					result.unsupported++;
@@ -403,10 +512,17 @@ int main(int argc, char** argv) {
 						memcpy(g_data, data0.data(), AreaSize);
 						memcpy(g_stack, stack0.data(), AreaSize);
 						g_signal = 0;
+#ifdef _WIN32
+						reinterpret_cast<void (*)()>(code)();
+						if (g_signal != 0) {
+							return false;
+						}
+#else
 						if (sigsetjmp(g_jump, 1) != 0) {
 							return false;
 						}
 						reinterpret_cast<void (*)()>(code)();
+#endif
 						*out = *g_state;
 						memcpy(data_out.data(), g_data, AreaSize);
 						memcpy(stack_out.data(), g_stack, AreaSize);
@@ -425,7 +541,7 @@ int main(int argc, char** argv) {
 						why = "replacement faulted (signal " + std::to_string(g_signal) + ")";
 					} else {
 						for (int i = 0; i < 16 && why.empty(); ++i) {
-							if (state0.gpr[i] != state1.gpr[i]) {
+							if ((state0.gpr[i] ^ state1.gpr[i]) & ~(i == random_reg ? random_bits : 0)) {
 								char buf[128];
 								snprintf(buf, sizeof buf, "gpr%d %016llx vs %016llx", i,
 								         (unsigned long long)state0.gpr[i],
@@ -463,7 +579,8 @@ int main(int argc, char** argv) {
 									int32_t a, b;
 									memcpy(&a, state0.ymm[r] + lane * 4, 4);
 									memcpy(&b, state1.ymm[r] + lane * 4, 4);
-									if (std::abs(static_cast<long>(a) - static_cast<long>(b)) > 1) {
+									// 64-bit: `long` is 32 bits on Windows.
+									if (std::llabs(int64_t {a} - int64_t {b}) > 1) {
 										close = false;
 									}
 								}
@@ -503,7 +620,11 @@ int main(int argc, char** argv) {
 							for (size_t i = 0; i < instance.bytes.size(); ++i) {
 								snprintf(hex + i * 3, 4, "%02x ", instance.bytes[i]);
 							}
-							result.first_failure = why + (flags_live ? " [flags live] " : " ") + hex;
+							result.first_failure = why +
+							                       (in_place     ? " [in place] "
+							                        : flags_live ? " [flags live] "
+							                                     : " ") +
+							                       hex;
 						}
 					}
 				}
@@ -511,9 +632,10 @@ int main(int argc, char** argv) {
 		}
 	}
 
-	long forms_ok = 0, forms_bad = 0, runs_total = 0, inexact_total = 0;
+	long forms_ok = 0, forms_bad = 0, runs_total = 0, inexact_total = 0, in_place_total = 0;
 	for (const auto& [form, r]: results) {
 		runs_total += r.runs;
+		in_place_total += r.in_place;
 		inexact_total += r.inexact;
 		const bool bad = r.failures || r.unsupported || r.bad_isa;
 		bad ? ++forms_bad : ++forms_ok;
@@ -524,7 +646,9 @@ int main(int argc, char** argv) {
 			       r.first_failure.c_str());
 		}
 	}
-	printf("\nforms: %zu (%ld pass, %ld fail), instances: %ld, runs: %ld, inexact FMA lanes: %ld\n",
-	       results.size(), forms_ok, forms_bad, total_instances, runs_total, inexact_total);
+	printf("\nforms: %zu (%ld pass, %ld fail), instances: %ld (%ld rewritten in place), runs: %ld, "
+	       "inexact FMA lanes: %ld\n",
+	       results.size(), forms_ok, forms_bad, total_instances, in_place_total, runs_total,
+	       inexact_total);
 	return forms_bad == 0 ? 0 : 1;
 }

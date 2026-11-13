@@ -1,0 +1,113 @@
+From: mixelpixx <11727006+mixelpixx@users.noreply.github.com>
+Subject: [PATCH] loader: PS4 CPU replacements: skip the RFLAGS save when the flags are dead
+
+GenerateVariableShift, GenerateGather and GenerateMoveMask always saved
+RFLAGS with PUSHFQ/POPFQ, because Generate did not pass flags_live on to
+them as it does for the BMI2 replacements. POPFQ is microcoded on Jaguar.
+Where FlagsLiveAfter finds the flags dead at load time, the slot is now
+only skipped. The run-time path still passes flags_live = true.
+---
+diff --git a/src/loader/jaguarCompat.cpp b/src/loader/jaguarCompat.cpp
+--- a/src/loader/jaguarCompat.cpp
++++ b/src/loader/jaguarCompat.cpp
+@@ -77,6 +77,7 @@ public:
+ 	int64_t                        stack_adjust = 0; // How far this code has lowered RSP.
+ 	bool                           ok           = true;
+ 	uint32_t                       used_vectors = 0;
++	bool                           flags_live   = true; // RFLAGS are read before being rewritten.
+ 
+ 	// A vector register the guest instruction does not name, for scratch use.
+ 	int Scratch() {
+@@ -183,6 +184,24 @@ public:
+ 		g.popfq();
+ 		stack_adjust -= 8;
+ 	}
++	// Reserve(bytes) with RFLAGS saved at [rsp] and the room at [rsp + 8]. When the flags are
++	// dead after the guest instruction the slot is only skipped: POPFQ is microcoded on Jaguar.
++	void ReserveSavingFlags(int64_t bytes) {
++		if (flags_live) {
++			Reserve(bytes);
++			PushFlags();
++		} else {
++			Reserve(bytes + 8);
++		}
++	}
++	void ReleaseSavingFlags(int64_t bytes) {
++		if (flags_live) {
++			PopFlags();
++			Release(bytes);
++		} else {
++			Release(bytes + 8);
++		}
++	}
+ 
+ 	// Saves (and later restores) full YMM scratch registers in the reserved room.
+ 	void SaveVectors(std::initializer_list<int> regs) {
+@@ -593,8 +612,7 @@ bool GenerateVariableShift(Emitter& e) {
+ 	constexpr int Counts = 40;
+ 	constexpr int SaveAx = 72;
+ 	constexpr int SaveCx = 80;
+-	e.Reserve(88);
+-	e.PushFlags();
++	e.ReserveSavingFlags(88);
+ 	e.g.mov(ptr[rsp + SaveAx], rax);
+ 	e.g.mov(ptr[rsp + SaveCx], rcx);
+ 	if (wide) {
+@@ -651,8 +669,7 @@ bool GenerateVariableShift(Emitter& e) {
+ 	}
+ 	e.g.mov(rax, ptr[rsp + SaveAx]);
+ 	e.g.mov(rcx, ptr[rsp + SaveCx]);
+-	e.PopFlags();
+-	e.Release(88);
++	e.ReleaseSavingFlags(88);
+ 	return e.ok;
+ }
+ 
+@@ -977,8 +994,7 @@ bool GenerateGather(Emitter& e) {
+ 	constexpr int SaveAx = 104;
+ 	constexpr int SaveCx = 112;
+ 	constexpr int SaveDx = 120;
+-	e.Reserve(120);
+-	e.PushFlags();
++	e.ReserveSavingFlags(120);
+ 	e.g.mov(ptr[rsp + SaveAx], rax);
+ 	e.g.mov(ptr[rsp + SaveCx], rcx);
+ 	e.g.mov(ptr[rsp + SaveDx], rdx);
+@@ -1026,8 +1042,7 @@ bool GenerateGather(Emitter& e) {
+ 	e.g.mov(rax, ptr[rsp + SaveAx]);
+ 	e.g.mov(rcx, ptr[rsp + SaveCx]);
+ 	e.g.mov(rdx, ptr[rsp + SaveDx]);
+-	e.PopFlags();
+-	e.Release(120);
++	e.ReleaseSavingFlags(120);
+ 	return e.ok;
+ }
+ 
+@@ -1048,8 +1063,7 @@ bool GenerateMoveMask(Emitter& e) {
+ 		return false;
+ 	}
+ 	// [rsp] RFLAGS, [rsp+8] the scratch register, [rsp+40] the upper bits.
+-	e.Reserve(40);
+-	e.PushFlags();
++	e.ReserveSavingFlags(40);
+ 	e.g.vmovdqu(ptr[rsp + 8], Xbyak::Ymm(t));
+ 	e.g.vextractf128(Xbyak::Xmm(t), Xbyak::Ymm(s), 1);
+ 	e.g.vpmovmskb(dst, Xbyak::Xmm(t));
+@@ -1058,8 +1072,7 @@ bool GenerateMoveMask(Emitter& e) {
+ 	e.g.vpmovmskb(dst, Xbyak::Xmm(s));
+ 	e.g.or_(dst, ptr[rsp + 40]);
+ 	e.g.vmovdqu(Xbyak::Ymm(t), ptr[rsp + 8]);
+-	e.PopFlags();
+-	e.Release(40);
++	e.ReleaseSavingFlags(40);
+ 	return e.ok;
+ }
+ 
+@@ -1326,6 +1339,7 @@ bool Generate(const ZydisDecodedInstruction& instruction, const ZydisDecodedOper
+ 		return false;
+ 	}
+ 	Emitter e(instruction, operands, address, generator);
++	e.flags_live = flags_live;
+ 	if (instruction.meta.isa_ext == ZYDIS_ISA_EXT_BMI2) {
+ 		return GenerateBmi2(e, flags_live);
+ 	}

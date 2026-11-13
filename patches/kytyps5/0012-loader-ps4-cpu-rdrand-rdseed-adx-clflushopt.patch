@@ -1,0 +1,311 @@
+From: mixelpixx <11727006+mixelpixx@users.noreply.github.com>
+Subject: [PATCH] loader: PS4 CPU replacements for RDRAND, RDSEED, ADCX, ADOX, CLFLUSHOPT
+
+Zen 2 has these and Jaguar does not; nothing handled them, so guest code
+that uses them without a CPUID check faulted. They are now part of
+JaguarCompat::IsMissing, so both the load-time and the run-time path
+replace them:
+
+- RDRAND/RDSEED: splitmix64 over a shared counter (LOCK XADD) seeded from
+  host randomness, CF = 1 and the other status flags 0. Not a
+  cryptographic generator.
+- ADCX/ADOX: ADC with the carry in CF, the carry out merged into the
+  saved RFLAGS, so only CF (ADCX) or OF (ADOX) changes.
+- CLFLUSHOPT: CLFLUSH, which is the same flush with stronger ordering.
+
+At load time, an instruction in a decoded function that the PS4's CPU
+lacks and nothing here handles is now logged once per mnemonic, so a later
+SIGILL can be explained from the log.
+---
+diff --git a/src/loader/guestInstructionPatcher.cpp b/src/loader/guestInstructionPatcher.cpp
+--- a/src/loader/guestInstructionPatcher.cpp
++++ b/src/loader/guestInstructionPatcher.cpp
+@@ -1076,11 +1076,66 @@ bool FlagsLiveAfter(const DecodedFunction& function, const DecodedCodeInstructio
+ 	return true;
+ }
+ 
++// Whether the PS4's CPU has the instruction, or KytyPS5 handles it some other way: SHA and
++// MONITORX/MWAITX are emulated when they fault, RDPID and CLWB rewritten (CollectAmdInstructions),
++// JaguarCompat::IsMissing ones replaced.
++bool RunsOnJaguar(const ZydisDecodedInstruction& instruction) {
++	switch (instruction.meta.isa_ext) {
++		case ZYDIS_ISA_EXT_BASE:
++		case ZYDIS_ISA_EXT_LONGMODE:
++		case ZYDIS_ISA_EXT_X87:
++		case ZYDIS_ISA_EXT_MMX:
++		case ZYDIS_ISA_EXT_SSE:
++		case ZYDIS_ISA_EXT_SSE2:
++		case ZYDIS_ISA_EXT_SSE3:
++		case ZYDIS_ISA_EXT_SSSE3:
++		case ZYDIS_ISA_EXT_SSE4:
++		case ZYDIS_ISA_EXT_SSE4A:
++		case ZYDIS_ISA_EXT_AVX:
++		case ZYDIS_ISA_EXT_AVXAES:
++		case ZYDIS_ISA_EXT_AES:
++		case ZYDIS_ISA_EXT_PCLMULQDQ:
++		case ZYDIS_ISA_EXT_F16C:
++		case ZYDIS_ISA_EXT_BMI1:
++		case ZYDIS_ISA_EXT_LZCNT:
++		case ZYDIS_ISA_EXT_MOVBE:
++		case ZYDIS_ISA_EXT_CLFSH:
++		case ZYDIS_ISA_EXT_PAUSE:
++		case ZYDIS_ISA_EXT_RDTSCP:
++		case ZYDIS_ISA_EXT_XSAVE:
++		case ZYDIS_ISA_EXT_XSAVEOPT:
++		case ZYDIS_ISA_EXT_MONITOR:
++		case ZYDIS_ISA_EXT_AMD3DNOW_PREFETCH:
++		case ZYDIS_ISA_EXT_SHA:
++		case ZYDIS_ISA_EXT_MONITORX:
++		case ZYDIS_ISA_EXT_RDPID:
++		case ZYDIS_ISA_EXT_CLWB: return true;
++		case ZYDIS_ISA_EXT_CET:
++			// Hint NOPs to a CPU without CET.
++			return instruction.mnemonic == ZYDIS_MNEMONIC_ENDBR64 ||
++			       instruction.mnemonic == ZYDIS_MNEMONIC_ENDBR32;
++		default: return JaguarCompat::IsMissing(instruction);
++	}
++}
++
+ void CollectJaguarInstructions(const DecodedFunction&                   function,
+                                std::map<uintptr_t, InstructionRewrite>& rewrite_sites,
+                                GuestInstructionPatchResult&             result) {
+ 	for (const auto& [address, decoded]: function.instructions) {
+ 		if (!JaguarCompat::IsMissing(decoded.instruction)) {
++			if (!RunsOnJaguar(decoded.instruction)) {
++				// Possibly behind a CPUID check; report each kind once, so a later SIGILL makes
++				// sense in the log.
++				static std::bitset<ZYDIS_MNEMONIC_MAX_VALUE + 1> reported;
++				if (!reported.test(decoded.instruction.mnemonic)) {
++					reported.set(decoded.instruction.mnemonic);
++					std::printf("PS4 CPU compatibility: %s (%s) at %p is not on this CPU and has no "
++					            "replacement; it faults if it runs\n",
++					            ZydisMnemonicGetString(decoded.instruction.mnemonic),
++					            ZydisISAExtGetString(decoded.instruction.meta.isa_ext),
++					            reinterpret_cast<void*>(address));
++				}
++			}
+ 			continue;
+ 		}
+ 		++result.jaguar.found;
+@@ -1090,7 +1145,7 @@ void CollectJaguarInstructions(const DecodedFunction&                   function
+ 	}
+ }
+ 
+-// Whether a linear pass over [start, end) meets an AVX2, FMA or BMI2 instruction. Functions
++// Whether a linear pass over [start, end) meets an AVX2, FMA, BMI2 (or other missing) instruction. Functions
+ // without one are not decoded when nothing else is patched; anything missed traps at run time.
+ bool MayUseJaguarMissing(uintptr_t start, uintptr_t end) {
+ 	ZydisDecodedInstruction instruction;
+diff --git a/src/loader/jaguarCompat.cpp b/src/loader/jaguarCompat.cpp
+--- a/src/loader/jaguarCompat.cpp
++++ b/src/loader/jaguarCompat.cpp
+@@ -1,14 +1,17 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+-// Replacements for AVX2, FMA and BMI2 instructions built from what the PS4's Jaguar CPU has
+-// (SSE4.2, AVX, BMI1, F16C). See jaguarCompat.h.
++// Replacements for AVX2, FMA and BMI2 instructions (and RDRAND, RDSEED, ADX, CLFLUSHOPT) built
++// from what the PS4's Jaguar CPU has (SSE4.2, AVX, BMI1, F16C). See jaguarCompat.h.
+ 
+ #include "loader/jaguarCompat.h"
+ 
+ #include <algorithm>
+ #include <array>
++#include <chrono>
+ #include <cstdlib>
+ #include <initializer_list>
++#include <random>
+ #include <string_view>
++#include <utility>
+ #include <xbyak/xbyak.h>
+ #include <xbyak/xbyak_util.h>
+ 
+@@ -28,8 +31,11 @@ ZydisRegister YmmReg(int index) {
+ }
+ ZydisRegister Gpr(ZydisRegister reg64, int bits) {
+ 	const int id = ZydisRegisterGetId(reg64);
+-	return bits == 64 ? static_cast<ZydisRegister>(ZYDIS_REGISTER_RAX + id)
+-	                  : static_cast<ZydisRegister>(ZYDIS_REGISTER_EAX + id);
++	switch (bits) {
++		case 64: return static_cast<ZydisRegister>(ZYDIS_REGISTER_RAX + id);
++		case 16: return static_cast<ZydisRegister>(ZYDIS_REGISTER_AX + id);
++		default: return static_cast<ZydisRegister>(ZYDIS_REGISTER_EAX + id);
++	}
+ }
+ 
+ bool IsVector(ZydisRegister reg) {
+@@ -1108,6 +1114,11 @@ public:
+ 		e.Release(0);
+ 	}
+ 
++	// Offset from RSP of the saved RFLAGS (when they are saved); Finish() restores them from there.
++	int FlagsSlot() const {
++		return count * 8;
++	}
++
+ 	// Offset from RSP of the saved copy of `reg64`, or -1.
+ 	int Slot(ZydisRegister reg64) const {
+ 		for (int i = 0; i < count; ++i) {
+@@ -1138,13 +1149,18 @@ public:
+ 		}
+ 	}
+ 
+-	// Guest register operand `index` = work (64-bit register; a 32-bit result is zero-extended).
++	// Guest register operand `index` = work (64-bit register; a 32-bit result is zero-extended,
++	// a 16-bit one keeps the upper bits).
+ 	void Write(int index, ZydisRegister work, int bits) {
+ 		const auto& op    = e.ops[index];
+ 		const auto  reg64 = ZydisRegisterGetLargestEnclosing(ZYDIS_MACHINE_MODE_LONG_64, op.reg.value);
+ 		const int   slot  = Slot(reg64);
+ 		const auto  w64   = Xbyak::Reg64(ZydisRegisterGetId(work));
+ 		if (slot >= 0) {
++			if (bits == 16) {
++				e.g.mov(word[rsp + slot], Xbyak::Reg16(ZydisRegisterGetId(work)));
++				return;
++			}
+ 			if (bits == 32) {
+ 				const auto w32 = Xbyak::Reg32(ZydisRegisterGetId(work));
+ 				e.g.mov(w32, w32);
+@@ -1301,6 +1317,101 @@ bool GenerateBmi2(Emitter& e, bool flags_live) {
+ 	}
+ }
+ 
++// ---------------------------------------------------------------------------------------------
++// Other instructions Zen 2 has and the PS4's CPU does not (legacy encoded).
++
++// RDRAND/RDSEED values: splitmix64 over a shared counter seeded from host randomness. Different on
++// every run and statistically sound, but not a cryptographic generator: whoever sees one value can
++// work out the next ones.
++alignas(64) uint64_t g_random_state = [] {
++	std::random_device device;
++	return (uint64_t {device()} << 32 ^ device()) ^
++	       static_cast<uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count());
++}();
++
++bool GenerateLegacy(Emitter& e) {
++	switch (e.in.mnemonic) {
++		case ZYDIS_MNEMONIC_RDRAND:
++		case ZYDIS_MNEMONIC_RDSEED: {
++			if (e.in.operand_count_visible != 1 || e.ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER ||
++			    UsesStackPointer(e)) {
++				return false;
++			}
++			const int bits = e.ops[0].size;
++			// Every flag is written, so none are saved: CF = 1 (a value was ready) and
++			// OF = SF = ZF = AF = PF = 0, as 0 - 0xF0 leaves them in CMP.
++			GprWork w(e, {ZYDIS_REGISTER_RAX, ZYDIS_REGISTER_RCX, ZYDIS_REGISTER_RDX}, false);
++			e.g.mov(rdx, reinterpret_cast<uint64_t>(&g_random_state));
++			e.g.mov(rcx, 0x9e3779b97f4a7c15);
++			e.g.mov(rax, rcx);
++			e.g.lock();
++			e.g.xadd(ptr[rdx], rax);
++			e.g.add(rax, rcx);
++			const std::pair<int, uint64_t> steps[] = {{30, 0xbf58476d1ce4e5b9},
++			                                          {27, 0x94d049bb133111eb}};
++			for (const auto& [shift, multiplier]: steps) {
++				e.g.mov(rcx, rax);
++				e.g.shr(rcx, shift);
++				e.g.xor_(rax, rcx);
++				e.g.mov(rcx, multiplier);
++				e.g.imul(rax, rcx);
++			}
++			e.g.mov(rcx, rax);
++			e.g.shr(rcx, 31);
++			e.g.xor_(rax, rcx);
++			e.g.xor_(ecx, ecx);
++			e.g.cmp(cl, 0xf0);
++			w.Write(0, ZYDIS_REGISTER_RAX, bits);
++			w.Finish();
++			return e.ok;
++		}
++		case ZYDIS_MNEMONIC_ADCX:
++		case ZYDIS_MNEMONIC_ADOX: {
++			// ADCX adds with carry in and out through CF and leaves the other flags; ADOX does
++			// the same through OF. ADC does the addition with the carry in CF, and its carry out
++			// goes into the saved RFLAGS that Finish() restores.
++			const int bits = e.ops[0].size;
++			if (e.in.operand_count_visible != 2 || e.ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER ||
++			    (bits != 32 && bits != 64) || UsesStackPointer(e)) {
++				return false;
++			}
++			const bool carry = e.in.mnemonic == ZYDIS_MNEMONIC_ADCX;
++			GprWork    w(e, {ZYDIS_REGISTER_RAX, ZYDIS_REGISTER_RCX}, true);
++			const int  flags = w.FlagsSlot();
++			// The source (register or memory) first, while the guest registers that may address
++			// it are unchanged. MOV and PUSH leave CF as the guest had it.
++			w.Read(ZYDIS_REGISTER_RCX, 1, bits);
++			w.Read(ZYDIS_REGISTER_RAX, 0, bits);
++			if (!carry) {
++				e.g.bt(qword[rsp + flags], 11); // CF = the guest's OF.
++			}
++			if (bits == 64) {
++				e.g.adc(rax, rcx);
++			} else {
++				e.g.adc(eax, ecx);
++			}
++			e.g.setc(cl);
++			e.g.movzx(ecx, cl);
++			if (!carry) {
++				e.g.shl(ecx, 11);
++			}
++			e.g.and_(qword[rsp + flags], carry ? ~0x001 : ~0x800);
++			e.g.or_(qword[rsp + flags], rcx);
++			w.Write(0, ZYDIS_REGISTER_RAX, bits);
++			w.Finish();
++			return e.ok;
++		}
++		case ZYDIS_MNEMONIC_CLFLUSHOPT:
++			// CLFLUSH: the same flush and invalidation, more strongly ordered.
++			if (e.in.operand_count_visible != 1 || e.ops[0].type != ZYDIS_OPERAND_TYPE_MEMORY) {
++				return false;
++			}
++			e.Emit(ZYDIS_MNEMONIC_CLFLUSH, {e.Copy(0)});
++			return e.ok;
++		default: return false;
++	}
++}
++
+ } // namespace
+ 
+ bool TrapTest() {
+@@ -1328,18 +1439,26 @@ bool IsMissing(const ZydisDecodedInstruction& instruction) {
+ 		case ZYDIS_ISA_EXT_AVX2:
+ 		case ZYDIS_ISA_EXT_AVX2GATHER:
+ 		case ZYDIS_ISA_EXT_FMA:
+-		case ZYDIS_ISA_EXT_BMI2: return true;
++		case ZYDIS_ISA_EXT_BMI2:
++		case ZYDIS_ISA_EXT_ADOX_ADCX:
++		case ZYDIS_ISA_EXT_CLFLUSHOPT:
++		case ZYDIS_ISA_EXT_RDRAND:
++		case ZYDIS_ISA_EXT_RDSEED: return true;
+ 		default: return false;
+ 	}
+ }
+ 
+ bool Generate(const ZydisDecodedInstruction& instruction, const ZydisDecodedOperand* operands,
+               uint64_t address, Xbyak::CodeGenerator& generator, bool flags_live) {
+-	if (instruction.encoding != ZYDIS_INSTRUCTION_ENCODING_VEX) {
++	if (instruction.encoding != ZYDIS_INSTRUCTION_ENCODING_VEX &&
++	    instruction.encoding != ZYDIS_INSTRUCTION_ENCODING_LEGACY) {
+ 		return false;
+ 	}
+ 	Emitter e(instruction, operands, address, generator);
+ 	e.flags_live = flags_live;
++	if (instruction.encoding == ZYDIS_INSTRUCTION_ENCODING_LEGACY) {
++		return GenerateLegacy(e);
++	}
+ 	if (instruction.meta.isa_ext == ZYDIS_ISA_EXT_BMI2) {
+ 		return GenerateBmi2(e, flags_live);
+ 	}
+diff --git a/src/loader/jaguarCompat.h b/src/loader/jaguarCompat.h
+--- a/src/loader/jaguarCompat.h
++++ b/src/loader/jaguarCompat.h
+@@ -22,7 +22,8 @@ bool Enabled();
+ // instructions at load time, make them fault, so that every one goes through the run-time path.
+ bool TrapTest();
+ 
+-// Whether the instruction needs AVX2, FMA or BMI2.
++// Whether the instruction needs AVX2, FMA, BMI2 or another extension the PS4's CPU lacks
++// (RDRAND, RDSEED, ADX, CLFLUSHOPT).
+ bool IsMissing(const ZydisDecodedInstruction& instruction);
+ 
+ // Appends host code that has the same effect as the guest instruction at `address`: the same
