@@ -1,0 +1,173 @@
+From: mixelpixx <11727006+mixelpixx@users.noreply.github.com>
+Subject: [PATCH] loader: PS4 CPU replacements save RFLAGS with LAHF/SAHF, not PUSHFQ/POPFQ
+
+Where the flags are live after the guest instruction, the BMI2, ADCX/ADOX,
+gather and VPMOVMSKB replacements saved RFLAGS with PUSHFQ and POPFQ, a
+microcoded pair that takes 24 cycles on Jaguar (InstLatX64, AMD A4-5000
+"Kabini").
+
+SETO AL and LAHF now capture OF and SF ZF AF PF CF in AX, and ADD AL, 0x7F
+(signed overflow exactly when AL is 1) then SAHF restore them. On Kabini
+LAHF takes 2 cycles, SAHF 0.5, SETcc and ADD 1. DF and the system flags
+are no longer saved: no replacement changes them.
+
+GprWork always has RAX among its work registers when it saves the flags;
+it reloads the guest's RAX after the save, as a memory operand may be
+addressed through it. The gather and VPMOVMSKB replacements keep RAX in
+a slot of their own meanwhile. ADCX/ADOX update the carry or overflow in
+the saved word.
+---
+diff --git a/src/loader/jaguarCompat.cpp b/src/loader/jaguarCompat.cpp
+--- a/src/loader/jaguarCompat.cpp
++++ b/src/loader/jaguarCompat.cpp
+@@ -195,31 +195,45 @@ public:
+ 		g.lea(rsp, ptr[rsp + static_cast<int>(RedZone + bytes)]);
+ 		stack_adjust -= RedZone + bytes;
+ 	}
+-	void PushFlags() {
+-		g.pushfq();
+-		stack_adjust += 8;
+-	}
+-	void PopFlags() {
+-		g.popfq();
+-		stack_adjust -= 8;
+-	}
+-	// Reserve(bytes) with RFLAGS saved at [rsp] and the room at [rsp + 8]. When the flags are
+-	// dead after the guest instruction the slot is only skipped: POPFQ is microcoded on Jaguar.
++	// RFLAGS without PUSHFQ/POPFQ, a microcoded pair that takes 24 cycles on Jaguar (InstLatX64,
++	// Kabini): SETO AL and LAHF put OF and SF ZF AF PF CF in AX, stored at [rsp + slot]; ADD AL,
++	// 0x7F (signed overflow exactly when AL is 1) and SAHF bring them back, a few simple
++	// instructions each way. DF and the system flags are not saved: no replacement changes them.
++	// Both clobber RAX.
++	void SaveFlags(int slot) {
++		g.seto(al);
++		g.lahf();
++		g.mov(word[rsp + slot], ax);
++	}
++	void RestoreFlags(int slot) {
++		g.mov(ax, word[rsp + slot]);
++		g.add(al, 0x7f);
++		g.sahf();
++	}
++	// Reserve(bytes) with RFLAGS saved at [rsp] and the room at [rsp + 8]; RAX waits at
++	// [rsp + 8 + bytes] while AX carries the flags. When the flags are dead after the guest
++	// instruction the slot is only skipped.
+ 	void ReserveSavingFlags(int64_t bytes) {
+-		if (flags_live) {
+-			Reserve(bytes);
+-			PushFlags();
+-		} else {
++		if (!flags_live) {
+ 			Reserve(bytes + 8);
++			return;
+ 		}
++		const int keep = static_cast<int>(8 + bytes);
++		Reserve(bytes + 16);
++		g.mov(ptr[rsp + keep], rax);
++		SaveFlags(0);
++		g.mov(rax, ptr[rsp + keep]);
+ 	}
+ 	void ReleaseSavingFlags(int64_t bytes) {
+-		if (flags_live) {
+-			PopFlags();
+-			Release(bytes);
+-		} else {
++		if (!flags_live) {
+ 			Release(bytes + 8);
++			return;
+ 		}
++		const int keep = static_cast<int>(8 + bytes);
++		g.mov(ptr[rsp + keep], rax);
++		RestoreFlags(0);
++		g.mov(rax, ptr[rsp + keep]);
++		Release(bytes + 16);
+ 	}
+ 
+ 	// Saves (and later restores) full YMM scratch registers in the reserved room.
+@@ -1294,33 +1308,44 @@ bool GenerateMoveMask(Emitter& e) {
+ 
+ class GprWork {
+ public:
++	// With `save_flags`, RAX must be a work register: the flags pass through AX on the way to
++	// and from their slot.
+ 	GprWork(Emitter& e, std::initializer_list<ZydisRegister> regs, bool save_flags)
+ 	    : e(e), save_flags(save_flags) {
+ 		for (auto reg: regs) {
+ 			saved[count++] = reg;
+ 		}
+-		e.Reserve(0);
+-		if (save_flags) {
+-			e.PushFlags();
+-		}
++		e.Reserve(save_flags ? 8 : 0);
+ 		for (int i = 0; i < count; ++i) {
+ 			e.g.push(Xbyak::Reg64(ZydisRegisterGetId(saved[i])));
+ 			e.stack_adjust += 8;
+ 		}
++		if (save_flags) {
++			const int rax_slot = Slot(ZYDIS_REGISTER_RAX);
++			if (rax_slot < 0) {
++				e.ok = false;
++				return;
++			}
++			e.SaveFlags(FlagsSlot());
++			// The guest's RAX again: a memory operand may be addressed through it.
++			e.g.mov(rax, ptr[rsp + rax_slot]);
++		}
+ 	}
+ 
+ 	void Finish() {
++		if (save_flags) {
++			e.RestoreFlags(FlagsSlot()); // RAX is restored next.
++		}
+ 		for (int i = count - 1; i >= 0; --i) {
+ 			e.g.pop(Xbyak::Reg64(ZydisRegisterGetId(saved[i])));
+ 			e.stack_adjust -= 8;
+ 		}
+-		if (save_flags) {
+-			e.PopFlags();
+-		}
+-		e.Release(0);
++		e.Release(save_flags ? 8 : 0);
+ 	}
+ 
+-	// Offset from RSP of the saved RFLAGS (when they are saved); Finish() restores them from there.
++	// Offset from RSP of the saved RFLAGS (when they are saved): the word that SaveFlags stores,
++	// OF (0 or 1) in its low byte and LAHF's SF ZF AF PF CF in its high byte. Finish() restores
++	// them from there.
+ 	int FlagsSlot() const {
+ 		return count * 8;
+ 	}
+@@ -1585,11 +1610,11 @@ bool GenerateLegacy(Emitter& e) {
+ 			GprWork    w(e, {ZYDIS_REGISTER_RAX, ZYDIS_REGISTER_RCX}, true);
+ 			const int  flags = w.FlagsSlot();
+ 			// The source (register or memory) first, while the guest registers that may address
+-			// it are unchanged. MOV and PUSH leave CF as the guest had it.
++			// it are unchanged. Saving the flags and MOV leave CF as the guest had it.
+ 			w.Read(ZYDIS_REGISTER_RCX, 1, bits);
+ 			w.Read(ZYDIS_REGISTER_RAX, 0, bits);
+ 			if (!carry) {
+-				e.g.bt(qword[rsp + flags], 11); // CF = the guest's OF.
++				e.g.bt(word[rsp + flags], 0); // CF = the guest's OF (the saved word's bit 0).
+ 			}
+ 			if (bits == 64) {
+ 				e.g.adc(rax, rcx);
+@@ -1597,12 +1622,13 @@ bool GenerateLegacy(Emitter& e) {
+ 				e.g.adc(eax, ecx);
+ 			}
+ 			e.g.setc(cl);
+-			e.g.movzx(ecx, cl);
+-			if (!carry) {
+-				e.g.shl(ecx, 11);
++			if (carry) {
++				// CF is bit 0 of the LAHF byte.
++				e.g.and_(byte[rsp + flags + 1], 0xfe);
++				e.g.or_(byte[rsp + flags + 1], cl);
++			} else {
++				e.g.mov(byte[rsp + flags], cl); // OF as SETO stored it.
+ 			}
+-			e.g.and_(qword[rsp + flags], carry ? ~0x001 : ~0x800);
+-			e.g.or_(qword[rsp + flags], rcx);
+ 			w.Write(0, ZYDIS_REGISTER_RAX, bits);
+ 			w.Finish();
+ 			return e.ok;

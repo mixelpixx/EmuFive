@@ -22,9 +22,15 @@ GPR16 = ["ax", "cx", "dx", "bx", "bp", "si", "di", "r8w", "r9w", "r10w", "r11w",
 SIZE = {8: "byte", 16: "word", 32: "dword", 64: "qword", 128: "xmmword", 256: "ymmword"}
 
 
-def memory(bits, align=False):
+def memory(bits, align=False, segment=""):
     disp = rng.choice([0, 8, 0x40, -0x20, 0x100]) if not align else rng.choice([0, 0x40, -0x20])
-    kind = rng.choice(["base", "base", "index", "rsp", "rip"])
+    if segment:
+        # FS/GS (guest thread-local storage): on a base register, which the test aims at its data
+        # through the segment's base.
+        kind = rng.choice(["base", "index"])
+        segment += ":"
+    else:
+        kind = rng.choice(["base", "base", "index", "rsp", "rip"])
     if kind == "rip":
         return f"{SIZE[bits]} ptr [rip + {disp}]"
     if kind == "rsp":
@@ -32,11 +38,11 @@ def memory(bits, align=False):
     base = rng.choice(GPR64)
     if kind == "index":
         index = rng.choice([r for r in GPR64 if r != base])
-        return f"{SIZE[bits]} ptr [{base} + {index}*{rng.choice([1, 2, 4, 8])} + {disp}]"
-    return f"{SIZE[bits]} ptr [{base} + {disp}]"
+        return f"{SIZE[bits]} ptr {segment}[{base} + {index}*{rng.choice([1, 2, 4, 8])} + {disp}]"
+    return f"{SIZE[bits]} ptr {segment}[{base} + {disp}]"
 
 
-def operand(kind):
+def operand(kind, segment=""):
     if kind == "y":
         return f"ymm{rng.randrange(16)}"
     if kind == "x":
@@ -54,7 +60,7 @@ def operand(kind):
     if kind == "ilane":  # Moves whole 128-bit halves (VPERMQ/VPERMPD in-place rewrite).
         return hex(rng.choice([0x44, 0x4E, 0xEE, 0xE4]))
     if kind.startswith("m"):
-        return memory(int(kind[1:].rstrip("a")), align=kind.endswith("a"))
+        return memory(int(kind[1:].rstrip("a")), align=kind.endswith("a"), segment=segment)
     raise ValueError(kind)
 
 
@@ -142,14 +148,26 @@ GATHERS = {  # mnemonic: [(destination, index, mask)]
     "vpgatherqq": [("x", "x", "x"), ("y", "y", "y")],
 }
 
-print(".intel_syntax noprefix\n.text")
-for _ in range(COUNT):
-    for mnemonic, parts in FORMS:
-        print(f"\t{mnemonic} " + ", ".join(operand(p) for p in parts))
+def gathers(segment=""):
     for mnemonic, shapes in GATHERS.items():
         for dst, index, mask in shapes:
             regs = rng.sample(range(16), 3)
             data = 32 if mnemonic in ("vgatherdps", "vpgatherdd", "vgatherqps", "vpgatherqd") else 64
-            print(f"\t{mnemonic} {dst}mm{regs[0]}, {SIZE[data]} ptr [{rng.choice(GPR64)} + "
+            prefix = f"{segment}:" if segment else ""
+            print(f"\t{mnemonic} {dst}mm{regs[0]}, {SIZE[data]} ptr {prefix}[{rng.choice(GPR64)} + "
                   f"{index}mm{regs[1]}*{rng.choice([1, 2, 4, 8])} + {rng.choice([0, 8, -16])}], "
                   f"{mask}mm{regs[2]}")
+
+
+print(".intel_syntax noprefix\n.text")
+for _ in range(COUNT):
+    for mnemonic, parts in FORMS:
+        print(f"\t{mnemonic} " + ", ".join(operand(p) for p in parts))
+    gathers()
+# Every form with a memory operand again with an FS and a GS override, a few times each.
+for _ in range(3):
+    for segment in ("fs", "gs"):
+        for mnemonic, parts in FORMS:
+            if any(p.startswith("m") for p in parts):
+                print(f"\t{mnemonic} " + ", ".join(operand(p, segment) for p in parts))
+        gathers(segment)
