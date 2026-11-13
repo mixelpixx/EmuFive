@@ -1,0 +1,232 @@
+From: mixelpixx <11727006+mixelpixx@users.noreply.github.com>
+Subject: [PATCH] loader: PS4 CPU: gathers skip the mask tests when all are set, per-element shifts in SIMD
+
+Gathers tested the mask before each element, through memory, although
+most gathers have every mask element set. VMOVMSKPS/PD of the mask now
+picks an unrolled path with no tests when all the elements in use are
+set.
+
+VPSLLVD/Q, VPSRLVD/Q and VPSRAVD ran one element at a time in
+general-purpose registers through the stack, with RFLAGS saved. They are
+now done in SIMD: for each element, the 128-bit half is shifted by that
+element's count in an XMM register (VPSLLD, VPSRLQ, VPSRAD, ...), and a
+blend keeps that element. A shift by an XMM count reads the count as 64
+bits, so 32 (64) and more give 0, or the sign for VPSRAD, as the AVX2
+instructions want. A count in memory is loaded with VMOVD/VMOVQ, which
+zero-extends it. No general-purpose registers, flags or branches.
+---
+diff --git a/src/loader/jaguarCompat.cpp b/src/loader/jaguarCompat.cpp
+--- a/src/loader/jaguarCompat.cpp
++++ b/src/loader/jaguarCompat.cpp
+@@ -603,7 +603,11 @@ bool GeneratePermuteDwords(Emitter& e) {
+ }
+ 
+ // ---------------------------------------------------------------------------------------------
+-// Shifts with a count per element (VPSLLVD/Q, VPSRLVD/Q, VPSRAVD), one element at a time.
++// Shifts with a count per element (VPSLLVD/Q, VPSRLVD/Q, VPSRAVD), in SIMD: for each element, the
++// AVX shift of the whole 128-bit half by that element's count in an XMM register, then a blend
++// that keeps that element. A shift by an XMM count reads the count as 64 bits, so 32 (64) and
++// more give 0, or copies of the sign bit for VPSRAD, as these instructions want. No
++// general-purpose registers, flags or branches.
+ 
+ bool GenerateVariableShift(Emitter& e) {
+ 	if (e.in.operand_count_visible != 3 || e.ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER ||
+@@ -615,74 +619,93 @@ bool GenerateVariableShift(Emitter& e) {
+ 	const bool left     = mnemonic == ZYDIS_MNEMONIC_VPSLLVD || mnemonic == ZYDIS_MNEMONIC_VPSLLVQ;
+ 	const bool arith    = mnemonic == ZYDIS_MNEMONIC_VPSRAVD;
+ 	const bool wide     = IsYmm(e.ops[0].reg.value);
+-	const int  bytes    = wide ? 32 : 16;
+-	const int  element  = qwords ? 8 : 4;
+ 	const int  d        = VectorId(e.ops[0].reg.value);
+-	const int  a        = VectorId(e.ops[1].reg.value);
+-
+-	// [rsp] RFLAGS, [rsp+8] values, [rsp+40] counts, [rsp+72] RAX, [rsp+80] RCX.
+-	constexpr int Values = 8;
+-	constexpr int Counts = 40;
+-	constexpr int SaveAx = 72;
+-	constexpr int SaveCx = 80;
+-	e.ReserveSavingFlags(88);
+-	e.g.mov(ptr[rsp + SaveAx], rax);
+-	e.g.mov(ptr[rsp + SaveCx], rcx);
+-	if (wide) {
+-		e.g.vmovdqu(ptr[rsp + Values], Xbyak::Ymm(a));
+-	} else {
+-		e.g.vmovdqu(ptr[rsp + Values], Xbyak::Xmm(a));
+-	}
+-	const auto& counts = e.ops[2];
+-	if (counts.type == ZYDIS_OPERAND_TYPE_REGISTER) {
+-		const int c = VectorId(counts.reg.value);
+-		if (wide) {
+-			e.g.vmovdqu(ptr[rsp + Counts], Xbyak::Ymm(c));
+-		} else {
+-			e.g.vmovdqu(ptr[rsp + Counts], Xbyak::Xmm(c));
+-		}
+-	} else {
+-		e.Emit(ZYDIS_MNEMONIC_LEA, {RegOp(ZYDIS_REGISTER_RCX), e.Mem(2, 0, 8)});
+-		for (int offset = 0; offset < bytes; offset += 8) {
+-			e.g.mov(rax, ptr[rcx + offset]);
+-			e.g.mov(ptr[rsp + Counts + offset], rax);
+-		}
++	const int  source   = VectorId(e.ops[1].reg.value);
++	const bool memory   = e.ops[2].type == ZYDIS_OPERAND_TYPE_MEMORY;
++	const int  counts   = memory ? -1 : VectorId(e.ops[2].reg.value);
++	const int  per_half = qwords ? 2 : 4;
++	const int  size     = qwords ? 8 : 4;
++	// The result can go straight to the destination unless that is still to be read.
++	const bool in_place = d != source && d != counts;
++
++	std::array<int, 4> saved {};
++	int                saved_count = 0;
++	const auto         scratch     = [&] {
++		const int reg          = e.Scratch();
++		saved[saved_count++] = reg;
++		return reg;
++	};
++	const int t      = scratch();                         // A count, then a shifted half.
++	const int upper  = wide ? scratch() : -1;            // The source's upper half.
++	const int ucount = wide && !memory ? scratch() : -1; // The counts' upper half.
++	const int result = wide ? scratch() : -1;            // The upper result.
++	const int lower  = in_place ? d : wide ? upper : scratch(); // The lower result.
++	if (!e.ok) {
++		return false;
+ 	}
+-	for (int offset = 0; offset < bytes; offset += element) {
+-		Xbyak::Label zero;
+-		Xbyak::Label store;
+-		const auto   value = qwords ? Xbyak::Reg(rax) : Xbyak::Reg(eax);
+-		const auto   count = qwords ? Xbyak::Reg(rcx) : Xbyak::Reg(ecx);
+-		e.g.mov(value, ptr[rsp + Values + offset]);
+-		e.g.mov(count, ptr[rsp + Counts + offset]);
+-		e.g.cmp(count, qwords ? 63 : 31);
++	const std::span<const int> saved_regs(saved.data(), saved_count);
++	e.Reserve(32 * saved_count);
++	e.SaveVectors(saved_regs);
++
++	const auto X     = [](int r) { return Xbyak::Xmm(r); };
++	const auto shift = [&](int dst, int src, int count) {
+ 		if (arith) {
+-			e.g.jbe(store);
+-			e.g.mov(count, 31);
+-			e.g.L(store);
+-			e.g.sar(value, cl);
++			e.g.vpsrad(X(dst), X(src), X(count));
++		} else if (qwords) {
++			left ? e.g.vpsllq(X(dst), X(src), X(count)) : e.g.vpsrlq(X(dst), X(src), X(count));
+ 		} else {
+-			e.g.ja(zero);
+-			if (left) {
+-				e.g.shl(value, cl);
++			left ? e.g.vpslld(X(dst), X(src), X(count)) : e.g.vpsrld(X(dst), X(src), X(count));
++		}
++	};
++	// One 128-bit half: acc = src shifted element by element by the counts in register `count`
++	// or (count < 0) in memory at `offset`. acc is neither src nor count.
++	const auto half = [&](int acc, int src, int count, int offset) {
++		for (int i = 0; i < per_half; ++i) {
++			// The element's count, zero-extended to 64 bits, in `by`.
++			int by = t;
++			if (count < 0) {
++				e.Emit(qwords ? ZYDIS_MNEMONIC_VMOVQ : ZYDIS_MNEMONIC_VMOVD,
++				       {RegOp(XmmReg(t)), e.Mem(2, offset + i * size, size)});
++			} else if (i == 0) {
++				if (qwords) {
++					by = count; // Its low 64 bits are the count.
++				} else {
++					e.g.vpmovzxdq(X(t), X(count));
++				}
+ 			} else {
+-				e.g.shr(value, cl);
++				e.g.vpsrldq(X(t), X(count), i * size);
++				if (!qwords && i < 3) {
++					e.g.vpmovzxdq(X(t), X(t)); // Drop the next element's count.
++				}
++			}
++			if (i == 0) {
++				shift(acc, src, by);
++			} else {
++				shift(t, src, by);
++				qwords ? e.g.vblendpd(X(acc), X(acc), X(t), 1 << i)
++				       : e.g.vblendps(X(acc), X(acc), X(t), 1 << i);
+ 			}
+-			e.g.jmp(store);
+-			e.g.L(zero);
+-			e.g.xor_(eax, eax);
+-			e.g.L(store);
+ 		}
+-		e.g.mov(ptr[rsp + Values + offset], value);
+-	}
++	};
++
+ 	if (wide) {
+-		e.g.vmovdqu(Xbyak::Ymm(d), ptr[rsp + Values]);
++		e.g.vextractf128(X(upper), Xbyak::Ymm(source), 1);
++		if (!memory) {
++			e.g.vextractf128(X(ucount), Xbyak::Ymm(counts), 1);
++		}
++		half(result, upper, ucount, 16);
++		// `upper` is free now; the lower result may go there.
++		half(lower, source, counts, 0);
++		e.g.vinsertf128(Xbyak::Ymm(d), Xbyak::Ymm(lower), X(result), 1);
+ 	} else {
+-		e.g.vmovdqu(Xbyak::Xmm(d), ptr[rsp + Values]);
++		half(lower, source, counts, 0);
++		if (lower != d) {
++			e.g.vmovaps(X(d), X(lower)); // Clears the upper half, as VEX.128 does.
++		}
+ 	}
+-	e.g.mov(rax, ptr[rsp + SaveAx]);
+-	e.g.mov(rcx, ptr[rsp + SaveCx]);
+-	e.ReleaseSavingFlags(88);
++
++	e.RestoreVectors(saved_regs);
++	e.Release(32 * saved_count);
+ 	return e.ok;
+ }
+ 
+@@ -1161,10 +1184,7 @@ bool GenerateGather(Emitter& e) {
+ 	e.g.vmovdqu(ptr[rsp + Dest], Xbyak::Ymm(d));
+ 	e.g.vmovdqu(ptr[rsp + Index], Xbyak::Ymm(index));
+ 	e.g.vmovdqu(ptr[rsp + Mask], Xbyak::Ymm(mask));
+-	for (int i = 0; i < count; ++i) {
+-		Xbyak::Label skip;
+-		e.g.test(byte[rsp + Mask + i * data_size + data_size - 1], 0x80);
+-		e.g.jz(skip);
++	const auto load_element = [&](int i) {
+ 		if (qword_index) {
+ 			e.g.mov(rax, ptr[rsp + Index + i * 8]);
+ 		} else {
+@@ -1177,8 +1197,34 @@ bool GenerateGather(Emitter& e) {
+ 			e.g.mov(edx, ptr[rcx + rax * scale]);
+ 			e.g.mov(ptr[rsp + Dest + i * 4], edx);
+ 		}
++	};
++	// Most gathers have every mask element set: then every element loads, with no test each.
++	Xbyak::Label   some;
++	Xbyak::Label   gathered;
++	const uint32_t all = (1u << count) - 1;
++	if (dest_bytes == 32) {
++		qword_data ? e.g.vmovmskpd(eax, Xbyak::Ymm(mask)) : e.g.vmovmskps(eax, Xbyak::Ymm(mask));
++	} else {
++		qword_data ? e.g.vmovmskpd(eax, Xbyak::Xmm(mask)) : e.g.vmovmskps(eax, Xbyak::Xmm(mask));
++	}
++	if (count < dest_bytes / data_size) {
++		e.g.and_(eax, all); // Mask elements past the count do not matter.
++	}
++	e.g.cmp(eax, all);
++	e.g.jne(some, Xbyak::CodeGenerator::T_NEAR);
++	for (int i = 0; i < count; ++i) {
++		load_element(i);
++	}
++	e.g.jmp(gathered, Xbyak::CodeGenerator::T_NEAR);
++	e.g.L(some);
++	for (int i = 0; i < count; ++i) {
++		Xbyak::Label skip;
++		e.g.test(byte[rsp + Mask + i * data_size + data_size - 1], 0x80);
++		e.g.jz(skip);
++		load_element(i);
+ 		e.g.L(skip);
+ 	}
++	e.g.L(gathered);
+ 	for (int offset = count * data_size; offset < dest_bytes; offset += 4) {
+ 		e.g.mov(dword[rsp + Dest + offset], 0);
+ 	}

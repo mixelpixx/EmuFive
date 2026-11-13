@@ -4,6 +4,8 @@
 // natively and as its replacement from the same random state, and all registers, flags and
 // memory must match. It also checks that no replacement uses AVX2, FMA or BMI2 itself.
 //   jaguarTest [-n instances-per-form] [-r runs] code.bin...
+// With KYTY_JAGUAR_FMA=fast, FMA destinations are checked against a multiply then an add (each
+// rounded) instead of the fused native result.
 
 #include "loader/jaguarCompat.h"
 
@@ -168,6 +170,86 @@ static void BuildRunner(Xbyak::CodeGenerator& g, Body body) {
 	RestoreHost(g);
 }
 
+// KYTY_JAGUAR_FMA=fast: what an FMA form must leave in its destination, from the inputs of
+// operands 0, 1 and 2: per element, the product rounded, then the sum or difference rounded, in
+// the element's precision. Scalar forms keep the destination's other elements; the upper half is
+// zero unless the form is 256-bit.
+static bool FastFmaExpected(const ZydisDecodedInstruction& in, const uint8_t (*op)[32], bool wide,
+                            uint8_t* out, int* element_size) {
+	const std::string m = ZydisMnemonicGetString(in.mnemonic); // e.g. vfnmadd231ps
+	if (m.size() < 9 || m.compare(0, 2, "vf") != 0) {
+		return false;
+	}
+	const std::string type   = m.substr(m.size() - 2);
+	const int         order  = std::stoi(m.substr(m.size() - 5, 3));
+	const std::string name   = m.substr(2, m.size() - 7);
+	const bool        single = type[1] == 's';
+	const bool        scalar = type[0] == 's';
+	const bool        negate = name == "nmadd" || name == "nmsub";
+	const bool        minus  = name == "msub" || name == "nmsub";
+	const int         size   = single ? 4 : 8;
+	const int         count  = scalar ? 1 : (wide ? 32 : 16) / size;
+	int               a = 1, b = 2, c = 0; // 231
+	if (order == 132) {
+		a = 0, b = 2, c = 1;
+	} else if (order == 213) {
+		a = 1, b = 0, c = 2;
+	}
+	memset(out, 0, 32);
+	if (scalar) {
+		memcpy(out, op[0], 16);
+	}
+	for (int i = 0; i < count; ++i) {
+		// VFMADDSUB subtracts in even elements, VFMSUBADD in odd ones.
+		const bool subtract = name == "maddsub" ? i % 2 == 0 : name == "msubadd" ? i % 2 == 1 : minus;
+		if (single) {
+			float x, y, z;
+			memcpy(&x, op[a] + i * 4, 4);
+			memcpy(&y, op[b] + i * 4, 4);
+			memcpy(&z, op[c] + i * 4, 4);
+			volatile float product = x * y;
+			const float    p       = negate ? -product : product;
+			volatile float r       = subtract ? p - z : p + z;
+			const float    result  = r;
+			memcpy(out + i * 4, &result, 4);
+		} else {
+			double x, y, z;
+			memcpy(&x, op[a] + i * 8, 8);
+			memcpy(&y, op[b] + i * 8, 8);
+			memcpy(&z, op[c] + i * 8, 8);
+			volatile double product = x * y;
+			const double    p       = negate ? -product : product;
+			volatile double r       = subtract ? p - z : p + z;
+			const double    result  = r;
+			memcpy(out + i * 8, &result, 8);
+		}
+	}
+	*element_size = size;
+	return true;
+}
+
+// Bit for bit, except that any NaN stands for an expected NaN.
+static bool SameOrBothNaN(const uint8_t* expected, const uint8_t* actual, int size) {
+	for (int i = 0; i < 32; i += size) {
+		bool nan_e, nan_a;
+		if (size == 4) {
+			float e, a;
+			memcpy(&e, expected + i, 4);
+			memcpy(&a, actual + i, 4);
+			nan_e = std::isnan(e), nan_a = std::isnan(a);
+		} else {
+			double e, a;
+			memcpy(&e, expected + i, 8);
+			memcpy(&a, actual + i, 8);
+			nan_e = std::isnan(e), nan_a = std::isnan(a);
+		}
+		if (nan_e ? !nan_a : memcmp(expected + i, actual + i, size) != 0) {
+			return false;
+		}
+	}
+	return true;
+}
+
 struct Instance {
 	std::vector<uint8_t> bytes;
 	std::string          form;
@@ -293,6 +375,11 @@ int main(int argc, char** argv) {
 			ZydisDecoderDecodeFull(&decoder, instance.bytes.data(), instance.bytes.size(), &in, ops);
 			const bool bzhi = in.mnemonic == ZYDIS_MNEMONIC_BZHI;
 			const bool fma  = in.meta.isa_ext == ZYDIS_ISA_EXT_FMA;
+			static const bool fast_mode = [] {
+				const char* mode = std::getenv("KYTY_JAGUAR_FMA");
+				return mode != nullptr && std::string(mode) == "fast";
+			}();
+			const bool fast_fma = fma && fast_mode;
 			// RDRAND/RDSEED: the value is random, so the destination bits it writes are not
 			// compared (the rest of the register, the flags and everything else are).
 			int      random_reg  = -1;
@@ -469,6 +556,10 @@ int main(int argc, char** argv) {
 							                    in.mnemonic == ZYDIS_MNEMONIC_VGATHERQPD ||
 							                    in.mnemonic == ZYDIS_MNEMONIC_VPGATHERQD ||
 							                    in.mnemonic == ZYDIS_MNEMONIC_VPGATHERQQ;
+							// Half the runs with every mask element set, as most gathers have it.
+							if (rng() % 2 == 0) {
+								memset(s.ymm[ZydisRegisterGetId(placed_ops[2].reg.value)], 0xff, 32);
+							}
 							uint8_t* lanes = s.ymm[ZydisRegisterGetId(m.index)];
 							for (int lane = 0; lane < (qwords ? 4 : 8); ++lane) {
 								const int64_t v = static_cast<int64_t>(rng() % 64) - 32;
@@ -537,6 +628,42 @@ int main(int argc, char** argv) {
 					}
 					result.runs++;
 					std::string why;
+					// Fast FMA: the destination against multiply-then-add from this run's inputs.
+					int     fma_dst = -1;
+					int     fma_size = 4;
+					uint8_t fma_expected[32];
+					if (fast_fma) {
+						uint8_t inputs[3][32] = {};
+						for (int i = 0; i < 3; ++i) {
+							const auto& o = placed_ops[i];
+							if (o.type == ZYDIS_OPERAND_TYPE_REGISTER) {
+								memcpy(inputs[i], s.ymm[ZydisRegisterGetId(o.reg.value)], 32);
+								continue;
+							}
+							uint64_t address = data_target;
+							if (o.mem.base != ZYDIS_REGISTER_RIP) {
+								const auto gpr = [&](ZydisRegister r) {
+									return s.gpr[ZydisRegisterGetId(ZydisRegisterGetLargestEnclosing(
+									    ZYDIS_MACHINE_MODE_LONG_64, r))];
+								};
+								address = gpr(o.mem.base) + o.mem.disp.value +
+								          (o.mem.index == ZYDIS_REGISTER_NONE
+								               ? 0
+								               : gpr(o.mem.index) * o.mem.scale);
+							}
+							const uint64_t data  = reinterpret_cast<uint64_t>(g_data);
+							const uint64_t stack = reinterpret_cast<uint64_t>(g_stack);
+							const auto*    from  = address - data < AreaSize
+							                           ? data0.data() + (address - data)
+							                           : stack0.data() + (address - stack);
+							memcpy(inputs[i], from, o.size / 8);
+						}
+						fma_dst = ZydisRegisterGetId(placed_ops[0].reg.value);
+						FastFmaExpected(in, inputs,
+						                ZydisRegisterGetClass(placed_ops[0].reg.value) ==
+						                    ZYDIS_REGCLASS_YMM,
+						                fma_expected, &fma_size);
+					}
 					if (!repl_ok) {
 						why = "replacement faulted (signal " + std::to_string(g_signal) + ")";
 					} else {
@@ -572,6 +699,12 @@ int main(int argc, char** argv) {
 							      std::to_string(static_cast<long>(i) - static_cast<long>(AreaSize / 2));
 						}
 						for (int r = 0; r < 16 && why.empty(); ++r) {
+							if (r == fma_dst) {
+								if (!SameOrBothNaN(fma_expected, state1.ymm[r], fma_size)) {
+									why = "ymm" + std::to_string(r) + " is not multiply-then-add";
+								}
+								continue;
+							}
 							if (memcmp(state0.ymm[r], state1.ymm[r], 32) != 0) {
 								// FMA in single precision may differ in the last bit in rare cases.
 								bool close = fma;
