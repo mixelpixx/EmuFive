@@ -156,6 +156,8 @@ Jeux testés :
 |---|---|---|
 | God of War Sons of Sparta | PS4 Pro | Jouable, environ 40 FPS et plus |
 | Hollow Knight: Silksong | PS4 Pro | Jouable, de 50 à 60 FPS |
+| Plants vs. Zombies: Replanted | PS4 Pro | Jouable, 60 FPS constants |
+| Vampire Survivors | PS4 Slim | Jouable, 60 FPS stables |
 | Spider-Man 2 | | Pas encore testé |
 
 Vous avez testé un jeu ? Ouvrez une [issue](https://github.com/blue0x1/EmuFive/issues) avec le jeu, le modèle de votre console et comment il a tourné.
@@ -163,10 +165,9 @@ Vous avez testé un jeu ? Ouvrez une [issue](https://github.com/blue0x1/EmuFive/
 <a id="changelog"></a>
 ## Journal des modifications
 
-### 1.0.4 (2026-11-12)
+### 1.0.6 (2026-11-14)
 
-- Corrigé : la mise à jour du logiciel dans les Paramètres ne démarrait pas (« The update did not start. ») [#16](https://github.com/blue0x1/EmuFive/issues/16).
-- Corrigé : avec EmuFive installé sur une clé ou un disque USB, les jeux d'un second disque USB n'étaient pas trouvés [#15](https://github.com/blue0x1/EmuFive/issues/15).
+- Amélioré : l'écran d'accueil utilise beaucoup moins le processeur quand personne ne s'en sert (en 4K environ un tiers d'un cœur, contre un cœur entier avant), donc la PS4 chauffe moins et fait moins de bruit.
 
 Pour mettre à jour depuis la 1.0.3 ou avant, lancez la mise à jour une fois à la main, car l'ancienne mise à jour du logiciel n'y arrive pas : activez SSH dans les Paramètres, connectez-vous avec `ssh ps5@<adresse de la PS4>` (mot de passe `ps5` si vous ne l'avez pas changé) et lancez
 
@@ -174,7 +175,7 @@ Pour mettre à jour depuis la 1.0.3 ou avant, lancez la mise à jour une fois à
 sudo systemd-run --unit=emufive-update --collect /opt/ps5-on-ps4/bin/ps5-update install
 ```
 
-Elle installe toutes les mises à jour manquantes (depuis la 1.0.0 ou la 1.0.1, cela inclut les paquets du navigateur de la 1.0.2, environ 110 Mo), puis redémarrez depuis l'écran d'accueil. À partir de la 1.0.4, la mise à jour du logiciel dans les Paramètres fonctionne. Les nouvelles installations utilisent le `ps5-ps4-rootfs.tar.xz` de la version 1.0.4.
+Elle installe toutes les mises à jour manquantes (depuis la 1.0.0 ou la 1.0.1, cela inclut les paquets du navigateur de la 1.0.2, environ 110 Mo), puis redémarrez depuis l'écran d'accueil. À partir de la 1.0.4, la mise à jour du logiciel dans les Paramètres fonctionne. Les nouvelles installations utilisent le `ps5-ps4-rootfs.tar.xz` de la version 1.0.6.
 
 ## Organisation du projet
 

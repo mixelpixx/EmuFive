@@ -156,6 +156,8 @@ Juegos probados:
 |---|---|---|
 | God of War Sons of Sparta | PS4 Pro | Jugable, unos 40 FPS o más |
 | Hollow Knight: Silksong | PS4 Pro | Jugable, de 50 a 60 FPS |
+| Plants vs. Zombies: Replanted | PS4 Pro | Jugable, 60 FPS fijos |
+| Vampire Survivors | PS4 Slim | Jugable, 60 FPS estables |
 | Spider-Man 2 | | Aún no probado |
 
 ¿Probaste un juego? Abre un [issue](https://github.com/blue0x1/EmuFive/issues) con el juego, el modelo de tu consola y cómo funcionó.
@@ -163,10 +165,9 @@ Juegos probados:
 <a id="changelog"></a>
 ## Registro de cambios
 
-### 1.0.4 (2026-11-12)
+### 1.0.6 (2026-11-14)
 
-- Corregido: la actualización de software en Ajustes no se iniciaba («The update did not start.») [#16](https://github.com/blue0x1/EmuFive/issues/16).
-- Corregido: con EmuFive instalado en una unidad USB, no se encontraban los juegos de una segunda unidad USB [#15](https://github.com/blue0x1/EmuFive/issues/15).
+- Mejorado: la pantalla de inicio usa mucha menos CPU mientras nadie la usa (en 4K, un tercio de un núcleo; antes, un núcleo entero), así que la PS4 se calienta menos y hace menos ruido.
 
 Para actualizar desde la 1.0.3 o anteriores, inicia la actualización una vez a mano, porque la actualización de software antigua no puede: activa SSH en Ajustes, conéctate con `ssh ps5@<dirección de la PS4>` (contraseña `ps5` si no la cambiaste) y ejecuta
 
@@ -174,7 +175,7 @@ Para actualizar desde la 1.0.3 o anteriores, inicia la actualización una vez a 
 sudo systemd-run --unit=emufive-update --collect /opt/ps5-on-ps4/bin/ps5-update install
 ```
 
-Instala todas las actualizaciones que faltan (desde la 1.0.0 o la 1.0.1 eso incluye los paquetes del navegador de la 1.0.2, unos 110 MB); después reinicia desde la pantalla de inicio. Desde la 1.0.4, la actualización de software en Ajustes funciona. Las instalaciones nuevas usan el `ps5-ps4-rootfs.tar.xz` de la versión 1.0.4.
+Instala todas las actualizaciones que faltan (desde la 1.0.0 o la 1.0.1 eso incluye los paquetes del navegador de la 1.0.2, unos 110 MB); después reinicia desde la pantalla de inicio. Desde la 1.0.4, la actualización de software en Ajustes funciona. Las instalaciones nuevas usan el `ps5-ps4-rootfs.tar.xz` de la versión 1.0.6.
 
 ## Estructura del proyecto
 

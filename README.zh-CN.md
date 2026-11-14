@@ -156,6 +156,8 @@ EmuFive 和其他 Linux 系统一样，通过 [PS4 Multiboot](https://github.com
 |---|---|---|
 | God of War Sons of Sparta | PS4 Pro | 可玩，约 40 FPS 及以上 |
 | Hollow Knight: Silksong | PS4 Pro | 可玩，50 到 60 FPS |
+| Plants vs. Zombies: Replanted | PS4 Pro | 可玩，锁定 60 FPS |
+| Vampire Survivors | PS4 Slim | 可玩，稳定 60 FPS |
 | Spider-Man 2 | | 尚未测试 |
 
 测试过某个游戏？请开一个 [issue](https://github.com/blue0x1/EmuFive/issues)，写明游戏、主机型号和运行情况。
@@ -163,10 +165,9 @@ EmuFive 和其他 Linux 系统一样，通过 [PS4 Multiboot](https://github.com
 <a id="changelog"></a>
 ## 更新日志
 
-### 1.0.4 (2026-11-12)
+### 1.0.6 (2026-11-14)
 
-- 修复：设置中的软件更新无法开始（“The update did not start.”）[#16](https://github.com/blue0x1/EmuFive/issues/16)。
-- 修复：EmuFive 安装在 USB 驱动器上时，找不到第二个 USB 驱动器上的游戏 [#15](https://github.com/blue0x1/EmuFive/issues/15)。
+- 改进：无人操作时主屏幕占用的 CPU 大幅减少（4K 下约为一个核心的三分之一，之前占满一个核心），PS4 因此更凉、更安静。
 
 从 1.0.3 或更早版本更新时，旧的软件更新无法完成，请手动启动一次：在设置中打开 SSH，用 `ssh ps5@<PS4 地址>` 连接（未修改时密码为 `ps5`），然后运行
 
@@ -174,7 +175,7 @@ EmuFive 和其他 Linux 系统一样，通过 [PS4 Multiboot](https://github.com
 sudo systemd-run --unit=emufive-update --collect /opt/ps5-on-ps4/bin/ps5-update install
 ```
 
-它会安装所有缺少的更新（从 1.0.0 或 1.0.1 更新时包括 1.0.2 的浏览器软件包，约 110 MB），完成后在主屏幕上重启。从 1.0.4 起，设置中的软件更新可以正常使用。新安装请使用 1.0.4 版本中的 `ps5-ps4-rootfs.tar.xz`。
+它会安装所有缺少的更新（从 1.0.0 或 1.0.1 更新时包括 1.0.2 的浏览器软件包，约 110 MB），完成后在主屏幕上重启。从 1.0.4 起，设置中的软件更新可以正常使用。新安装请使用 1.0.6 版本中的 `ps5-ps4-rootfs.tar.xz`。
 
 ## 项目结构
 

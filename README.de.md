@@ -156,6 +156,8 @@ Getestete Spiele:
 |---|---|---|
 | God of War Sons of Sparta | PS4 Pro | Spielbar, etwa 40 FPS und mehr |
 | Hollow Knight: Silksong | PS4 Pro | Spielbar, 50 bis 60 FPS |
+| Plants vs. Zombies: Replanted | PS4 Pro | Spielbar, feste 60 FPS |
+| Vampire Survivors | PS4 Slim | Spielbar, stabile 60 FPS |
 | Spider-Man 2 | | Noch nicht getestet |
 
 Ein Spiel getestet? Eröffne ein [Issue](https://github.com/blue0x1/EmuFive/issues) mit dem Spiel, deinem Konsolenmodell und wie es lief.
@@ -163,10 +165,9 @@ Ein Spiel getestet? Eröffne ein [Issue](https://github.com/blue0x1/EmuFive/issu
 <a id="changelog"></a>
 ## Änderungsprotokoll
 
-### 1.0.4 (2026-11-12)
+### 1.0.6 (2026-11-14)
 
-- Behoben: Die Softwareaktualisierung in den Einstellungen startete nicht („The update did not start.“) [#16](https://github.com/blue0x1/EmuFive/issues/16).
-- Behoben: Mit EmuFive auf einem USB-Laufwerk installiert wurden Spiele auf einem zweiten USB-Laufwerk nicht gefunden [#15](https://github.com/blue0x1/EmuFive/issues/15).
+- Verbessert: Der Startbildschirm braucht viel weniger CPU, solange ihn niemand bedient (in 4K etwa ein Drittel eines Kerns statt eines ganzen Kerns), daher bleibt die PS4 kühler und leiser.
 
 Um von 1.0.3 oder älter zu aktualisieren, starte das Update einmal von Hand, da die alte Softwareaktualisierung es nicht kann: SSH in den Einstellungen einschalten, mit `ssh ps5@<Adresse der PS4>` verbinden (Passwort `ps5`, falls nicht geändert) und ausführen:
 
@@ -174,7 +175,7 @@ Um von 1.0.3 oder älter zu aktualisieren, starte das Update einmal von Hand, da
 sudo systemd-run --unit=emufive-update --collect /opt/ps5-on-ps4/bin/ps5-update install
 ```
 
-Es installiert alle fehlenden Updates (von 1.0.0 oder 1.0.1 aus gehören die Browser-Pakete von 1.0.2 dazu, etwa 110 MB); danach über den Startbildschirm neu starten. Ab 1.0.4 funktioniert die Softwareaktualisierung in den Einstellungen. Neuinstallationen verwenden die `ps5-ps4-rootfs.tar.xz` der Version 1.0.4.
+Es installiert alle fehlenden Updates (von 1.0.0 oder 1.0.1 aus gehören die Browser-Pakete von 1.0.2 dazu, etwa 110 MB); danach über den Startbildschirm neu starten. Ab 1.0.4 funktioniert die Softwareaktualisierung in den Einstellungen. Neuinstallationen verwenden die `ps5-ps4-rootfs.tar.xz` der Version 1.0.6.
 
 ## Projektaufbau
 

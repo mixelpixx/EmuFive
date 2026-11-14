@@ -156,6 +156,8 @@ Denenen oyunlar:
 |---|---|---|
 | God of War Sons of Sparta | PS4 Pro | Oynanabilir, yaklaşık 40 FPS ve üzeri |
 | Hollow Knight: Silksong | PS4 Pro | Oynanabilir, 50 ile 60 FPS arası |
+| Plants vs. Zombies: Replanted | PS4 Pro | Oynanabilir, sabit 60 FPS |
+| Vampire Survivors | PS4 Slim | Oynanabilir, kararlı 60 FPS |
 | Spider-Man 2 | | Henüz denenmedi |
 
 Bir oyun mu denediniz? Oyunu, konsol modelinizi ve nasıl çalıştığını yazarak bir [issue](https://github.com/blue0x1/EmuFive/issues) açın.
@@ -163,10 +165,9 @@ Bir oyun mu denediniz? Oyunu, konsol modelinizi ve nasıl çalıştığını yaz
 <a id="changelog"></a>
 ## Değişiklik günlüğü
 
-### 1.0.4 (2026-11-12)
+### 1.0.6 (2026-11-14)
 
-- Düzeltildi: Ayarlar'daki yazılım güncellemesi başlamıyordu ("The update did not start.") [#16](https://github.com/blue0x1/EmuFive/issues/16).
-- Düzeltildi: EmuFive bir USB sürücüye kuruluyken, ikinci bir USB sürücüdeki oyunlar bulunmuyordu [#15](https://github.com/blue0x1/EmuFive/issues/15).
+- İyileştirildi: ana ekran kullanılmadığı sürece çok daha az CPU kullanıyor (4K'da bir çekirdeğin yaklaşık üçte biri, önceden bir çekirdeğin tamamı); böylece PS4 daha serin ve sessiz çalışıyor.
 
 1.0.3 veya önceki bir sürümden güncellemek için, eski yazılım güncellemesi bunu yapamadığından güncellemeyi bir kez elle başlatın: Ayarlar'da SSH'yi açın, `ssh ps5@<PS4 adresi>` ile bağlanın (değiştirmediyseniz parola `ps5`) ve çalıştırın:
 
@@ -174,7 +175,7 @@ Bir oyun mu denediniz? Oyunu, konsol modelinizi ve nasıl çalıştığını yaz
 sudo systemd-run --unit=emufive-update --collect /opt/ps5-on-ps4/bin/ps5-update install
 ```
 
-Eksik tüm güncellemeleri kurar (1.0.0 veya 1.0.1'den buna 1.0.2'nin yaklaşık 110 MB'lık tarayıcı paketleri dahildir); ardından ana ekrandan yeniden başlatın. 1.0.4'ten itibaren Ayarlar'daki yazılım güncellemesi çalışır. Yeni kurulumlar 1.0.4 sürümündeki `ps5-ps4-rootfs.tar.xz` dosyasını kullanır.
+Eksik tüm güncellemeleri kurar (1.0.0 veya 1.0.1'den buna 1.0.2'nin yaklaşık 110 MB'lık tarayıcı paketleri dahildir); ardından ana ekrandan yeniden başlatın. 1.0.4'ten itibaren Ayarlar'daki yazılım güncellemesi çalışır. Yeni kurulumlar 1.0.6 sürümündeki `ps5-ps4-rootfs.tar.xz` dosyasını kullanır.
 
 ## Proje yapısı
 
