@@ -1,0 +1,867 @@
+From: mixelpixx <11727006+mixelpixx@users.noreply.github.com>
+Subject: [PATCH] loader: PS4 CPU: FMA gives the fused result bit for bit, in every MXCSR mode
+
+The default FMA replacement computed single precision as a multiply and
+an add in double precision, rounded twice, and double precision as a
+multiply and an add, each rounded. Results differed from the PS5's in
+the last bit (in double precision often, where the sum cancels), and in
+some NaN cases. It now gives the fused result bit for bit:
+
+- Single precision: the product is exact in double precision. The sum
+  is rounded to odd (TwoSum gives its exact error; where that is nonzero
+  and the sum even, the sum moves one ulp toward the exact one) and then
+  to float: one correct rounding (Boldo and Melquiond, 2008), in every
+  rounding mode, with FTZ and DAZ too.
+- Double precision: Dekker's product gives a*b = ph + pl exactly, then
+  (th, tl) = TwoSum(ph, c), v = tl + pl rounded to odd, result = th + v,
+  all in vector registers. That holds where MXCSR rounds to nearest and
+  no intermediate value overflows or is subnormal. A vector test sends
+  the other lanes to FmaFallback, a C++ function the code calls with
+  every register saved: it adds the integer significands and rounds as
+  MXCSR says (rounding control, FTZ after rounding, DAZ).
+- NaNs: a's NaN, else b's, else c's (also where a*b is 0 times
+  infinity), quieted, with the sign the instruction keeps. An infinite c
+  with finite a and b gives c, also where a*b overflows in double
+  precision.
+
+The MXCSR status flags are not kept exact. KYTY_JAGUAR_FMA=fast is
+unchanged and stays three to four times cheaper.
+---
+diff --git a/src/loader/jaguarCompat.cpp b/src/loader/jaguarCompat.cpp
+--- a/src/loader/jaguarCompat.cpp
++++ b/src/loader/jaguarCompat.cpp
+@@ -15,6 +15,7 @@
+ #include <utility>
+ #include <xbyak/xbyak.h>
+ #include <xbyak/xbyak_util.h>
++#include <xmmintrin.h>
+ 
+ using namespace Xbyak::util;
+ 
+@@ -786,9 +787,28 @@ bool GenerateExtension(Emitter& e) {
+ }
+ 
+ // ---------------------------------------------------------------------------------------------
+-// FMA. Single precision is computed in double precision: the product of two floats is exact
+-// there, so only the final sum is rounded (twice: to double, then to float), which matches a
+-// fused result except in extremely rare halfway cases. Double precision is a multiply and an add.
++// FMA. By default the result is the fused one, bit for bit; KYTY_JAGUAR_FMA=fast trades that for
++// speed (GenerateFastFma).
++//
++// Single precision: the product of two floats is exact in double precision, so a*b + c is one
++// double-precision addition, s. Rounding s to float is a second rounding, which picks the wrong
++// float when s lands exactly halfway between two floats although the sum was not exact. So s is
++// rounded to odd instead (Boldo and Melquiond, "Emulation of FMA and correctly rounded sums:
++// proved algorithms using rounding to odd", IEEE Transactions on Computers, 2008): TwoSum gives
++// the exact error of s, and where it is nonzero and s even, s moves one ulp toward the exact sum.
++// A double rounded to odd, then to float, is the float the exact sum rounds to.
++//
++// Double precision: Dekker's product splits a*b exactly into ph + pl, and then
++//   (th, tl) = TwoSum(ph, c),  v = tl + pl rounded to odd,  result = th + v
++// is the fused result (same paper). That needs MXCSR to round to nearest, nothing to overflow and
++// no intermediate value to be subnormal, which FTZ would flush. Other lanes go to FmaFallback,
++// where ExactFma adds the integer significands. A NaN or infinite input there gets th, the plain
++// sum, except an infinite c with finite a and b: c, although ph may have overflowed. Where a*b is
++// exact (pl = 0, a zero factor for one) the result is th itself.
++//
++// A NaN result is a's NaN, else b's, else c's (also where a*b is 0 times infinity), quieted, with
++// its sign kept where the product or c is negated, as the instruction gives it; only without a
++// NaN input is it a new one. The MXCSR status flags are not kept exact.
+ 
+ struct FmaForm {
+ 	int  order = 0;     // 132, 213 or 231.
+@@ -849,8 +869,7 @@ bool GetFmaForm(ZydisMnemonic mnemonic, FmaForm* form) {
+ // KYTY_JAGUAR_FMA=fast: a multiply and an add or subtract at the instruction's own width and
+ // precision, rounded twice, as code compiled without FMA would do. Much cheaper than the exact
+ // path, but the result can differ from the fused one (most of all when the sum cancels), and
+-// NaN signs and payloads follow the AVX instructions. Double precision gives the same numbers as
+-// the exact path, which is a multiply and an add too.
++// NaN signs and payloads follow the AVX instructions.
+ bool FastFma() {
+ 	static const bool fast = [] {
+ 		const char* mode = std::getenv("KYTY_JAGUAR_FMA");
+@@ -970,183 +989,619 @@ bool GenerateFastFma(Emitter& e, const FmaForm& form, bool wide) {
+ 	return e.ok;
+ }
+ 
+-bool GenerateFma(Emitter& e) {
+-	FmaForm form;
+-	if (!GetFmaForm(e.in.mnemonic, &form) || e.in.operand_count_visible != 3 ||
+-	    e.ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER || e.ops[1].type != ZYDIS_OPERAND_TYPE_REGISTER) {
+-		return false;
++// Loads part `part` (0: low 128 bits, 1: high 128 bits) of FMA operand i into scratch t as
++// doubles: four from packed single, the whole register for packed double, element 0 for scalar.
++void LoadFmaOperand(Emitter& e, const FmaForm& form, bool wide, int t, int i, int part) {
++	const auto& op     = e.ops[i];
++	const bool  memory = op.type == ZYDIS_OPERAND_TYPE_MEMORY;
++	const int   reg    = memory ? 0 : VectorId(op.reg.value);
++	if (form.single && !form.scalar) {
++		if (memory) {
++			e.Emit(ZYDIS_MNEMONIC_VCVTPS2PD, {RegOp(YmmReg(t)), e.Mem(i, 16 * part, 16)});
++		} else if (part == 1) {
++			e.g.vextractf128(Xbyak::Xmm(t), Xbyak::Ymm(reg), 1);
++			e.g.vcvtps2pd(Xbyak::Ymm(t), Xbyak::Xmm(t));
++		} else {
++			e.g.vcvtps2pd(Xbyak::Ymm(t), Xbyak::Xmm(reg));
++		}
++	} else if (form.single && memory) {
++		// VCVTSS2SD keeps the upper half of its first source: zeroed, it does not wait for t.
++		e.g.vxorps(Xbyak::Xmm(t), Xbyak::Xmm(t), Xbyak::Xmm(t));
++		e.Emit(ZYDIS_MNEMONIC_VCVTSS2SD, {RegOp(XmmReg(t)), RegOp(XmmReg(t)), e.Mem(i, 0, 4)});
++	} else if (form.single) {
++		e.g.vcvtss2sd(Xbyak::Xmm(t), Xbyak::Xmm(reg), Xbyak::Xmm(reg));
++	} else if (!form.scalar) {
++		const auto dst = RegOp(wide ? YmmReg(t) : XmmReg(t));
++		e.Emit(ZYDIS_MNEMONIC_VMOVUPD, {dst, memory ? e.Mem(i, 0, wide ? 32 : 16)
++		                                            : RegOp(wide ? YmmReg(reg) : XmmReg(reg))});
++	} else if (memory) {
++		e.Emit(ZYDIS_MNEMONIC_VMOVSD, {RegOp(XmmReg(t)), e.Mem(i, 0, 8)});
++	} else {
++		e.g.vmovapd(Xbyak::Xmm(t), Xbyak::Xmm(reg));
+ 	}
+-	const bool wide = IsYmm(e.ops[0].reg.value);
+-	if (wide && form.scalar) {
+-		return false;
++}
++
++// a*b + c for finite doubles (as bits), rounded once as MXCSR says: the rounding control, FTZ
++// (a result that is tiny after rounding becomes zero, which is how x86 detects it) and DAZ
++// (subnormal inputs count as zero).
++uint64_t ExactFma(uint64_t a, uint64_t b, uint64_t c, uint32_t mxcsr) {
++	using U128            = unsigned __int128;
++	constexpr uint64_t One = 1;
++	const bool         daz      = (mxcsr & 0x40) != 0;
++	const bool         ftz      = (mxcsr & 0x8000) != 0;
++	const int          rounding = static_cast<int>((mxcsr >> 13) & 3); // Nearest, down, up, zero.
++	struct Value {
++		U128 m;    // Significand.
++		int  e;    // Exponent of its lowest bit.
++		int  sign;
++	};
++	const auto unpack = [daz](uint64_t x) {
++		const int      exponent = static_cast<int>((x >> 52) & 0x7ff);
++		const uint64_t m        = x & ((One << 52) - 1);
++		const int      sign     = static_cast<int>(x >> 63);
++		if (exponent == 0) {
++			return Value {daz ? 0 : m, -1074, sign};
++		}
++		return Value {m | (One << 52), exponent - 1075, sign};
++	};
++	const auto width = [](U128 v) {
++		const auto high = static_cast<uint64_t>(v >> 64);
++		const auto low  = static_cast<uint64_t>(v);
++		return high != 0 ? 128 - __builtin_clzll(high) : low != 0 ? 64 - __builtin_clzll(low) : 0;
++	};
++	const Value va = unpack(a);
++	const Value vb = unpack(b);
++	Value       x {va.m * vb.m, va.e + vb.e, va.sign ^ vb.sign}; // Exact: 106 bits at most.
++	Value       y = unpack(c);
++	if (x.m == 0 && y.m == 0) {
++		// An exact zero: negative when both are, or when they differ and rounding is down.
++		return static_cast<uint64_t>(x.sign == y.sign ? x.sign : rounding == 1) << 63;
++	}
++	// Each nonzero significand moves up to bit 125 (two bits spare for the carry). Then the smaller
++	// value moves right to the larger one's exponent, the bits it loses kept as a sticky bit 0. A
++	// difference cancels more than one bit only when that shift is at most one, which loses
++	// nothing; otherwise rounding happens far above bit 0.
++	for (Value* v: {&x, &y}) {
++		if (v->m != 0) {
++			const int shift = 126 - width(v->m);
++			v->m <<= shift;
++			v->e -= shift;
++		}
+ 	}
+-	const int d = VectorId(e.ops[0].reg.value);
+-	// product = a * b, result = product +/- c.
+-	int a = 0;
+-	int b = 0;
+-	int c = 0;
+-	switch (form.order) {
+-		case 132: a = 0, b = 2, c = 1; break;
+-		case 213: a = 1, b = 0, c = 2; break;
+-		default: a = 1, b = 2, c = 0; break;
++	if (x.m == 0) {
++		x.e = y.e;
++	}
++	if (y.m == 0) {
++		y.e = x.e;
++	}
++	if (y.e > x.e || (y.e == x.e && y.m > x.m)) {
++		std::swap(x, y);
++	}
++	const int shift = x.e - y.e;
++	if (shift >= 128) {
++		y.m = y.m != 0 ? 1 : 0;
++	} else if (shift > 0) {
++		y.m = (y.m >> shift) | ((y.m & ((U128 {1} << shift) - 1)) != 0 ? 1 : 0);
++	}
++	const int  sign = x.sign;
++	const U128 sum  = x.sign == y.sign ? x.m + y.m : x.m - y.m;
++	if (sum == 0) {
++		return static_cast<uint64_t>(rounding == 1) << 63; // Exact cancellation.
++	}
++	const int top = x.e + width(sum) - 1; // Exponent of the sum's top bit.
++	// The sum rounded to a significand whose lowest bit has exponent `*low` (one more if rounding
++	// carried into a 54th bit).
++	const auto rounded = [&](int* low) {
++		const int drop = *low - x.e;
++		if (drop <= 0) {
++			return static_cast<uint64_t>(sum << -drop);
++		}
++		uint64_t m    = 0;
++		U128     rest = sum;
++		U128     half = U128 {1} << 127; // Above any sum.
++		if (drop < 128) {
++			m    = static_cast<uint64_t>(sum >> drop);
++			rest = sum & ((U128 {1} << drop) - 1);
++			half = U128 {1} << (drop - 1);
++		}
++		bool up = false;
++		switch (rounding) {
++			case 0: up = rest > half || (rest == half && (m & 1) != 0); break;
++			case 1: up = rest != 0 && sign != 0; break;
++			case 2: up = rest != 0 && sign == 0; break;
++			default: break;
++		}
++		m += up ? 1 : 0;
++		if (m == One << 53) {
++			m >>= 1;
++			++*low;
++		}
++		return m;
++	};
++	if (ftz) {
++		int unbounded = top - 52;
++		rounded(&unbounded);
++		if (unbounded + 52 < -1022) {
++			return static_cast<uint64_t>(sign) << 63;
++		}
+ 	}
+-	if (FastFma()) {
+-		return GenerateFastFma(e, form, wide);
++	int            low    = std::max(top - 52, -1074);
++	const uint64_t m      = rounded(&low);
++	uint64_t       result = m; // Subnormal (low is -1074) unless the top bit is set.
++	if (m >= One << 52) {
++		const int biased = low + 1075;
++		if (biased >= 2047) {
++			const bool infinity = rounding == 0 || (rounding == 1 && sign != 0) ||
++			                      (rounding == 2 && sign == 0);
++			result              = infinity ? 0x7ff0000000000000 : 0x7fefffffffffffff;
++		} else {
++			result = (static_cast<uint64_t>(biased) << 52) | (m - (One << 52));
++		}
+ 	}
+-	const int t1 = e.Scratch();
+-	const int t2 = e.Scratch();
+-	const int t3 = wide && form.single ? e.Scratch() : t2; // Upper result of 8 floats.
+-	const int t4 = form.alternate == 2 ? e.Scratch() : t2; // VFMSUBADD: the differences.
+-	if (!e.ok) {
+-		return false;
++	return result | (static_cast<uint64_t>(sign) << 63);
++}
++
++// The frame a double-precision FMA keeps on the stack, 32 bytes (four lanes) per slot. All but
++// the last are for FmaFallback.
++enum FmaSlot : int {
++	SlotA,      // a.
++	SlotB,      // b.
++	SlotC,      // c, negated in the lanes that subtract it.
++	SlotGuestC, // c as the guest has it.
++	SlotPlain,  // a*b +/- c rounded: the result where a*b is exact.
++	SlotResult, // The result.
++	SlotOk,     // All ones in the lanes the vector code got exact.
++	SlotPl,     // a*b - ph, exactly.
++	FmaSlotCount
++};
++
++// The lanes a double-precision FMA left to it (GenerateExactFmaDouble). `flags`: the lane
++// count, plus 8 when the product is negated. Where c is the only NaN, the result is c's NaN,
++// quieted (the plain sum has the new NaN of 0 times infinity there, where there is one). Where
++// only c is infinite, it is c: the exact a*b is finite, also where ph overflowed. Other lanes with
++// a NaN or infinite input get the plain result, which has a's or b's NaN where there is one.
++void FmaFallback(uint64_t* frame, uint32_t flags) {
++	constexpr uint64_t Sign   = uint64_t {1} << 63;
++	constexpr uint64_t Quiet  = uint64_t {1} << 51;
++	const auto         finite = [](uint64_t x) { return ((x >> 52) & 0x7ff) != 0x7ff; };
++	const auto         nan    = [](uint64_t x) { return (x & ~Sign) > 0x7ff0000000000000; };
++	const auto         lane   = [frame](int slot, uint32_t i) -> uint64_t& { return frame[slot * 4 + i]; };
++	const uint32_t     mxcsr  = _mm_getcsr();
++	for (uint32_t i = 0; i < (flags & 7); ++i) {
++		if ((lane(SlotOk, i) & Sign) != 0) {
++			continue;
++		}
++		const uint64_t a = lane(SlotA, i) ^ ((flags & 8) != 0 ? Sign : 0);
++		const uint64_t b = lane(SlotB, i);
++		const uint64_t c = lane(SlotC, i);
++		if (!nan(a) && !nan(b) && nan(c)) {
++			lane(SlotResult, i) = lane(SlotGuestC, i) | Quiet;
++		} else if (finite(a) && finite(b)) {
++			lane(SlotResult, i) = finite(c) ? ExactFma(a, b, c, mxcsr) : c;
++		} else {
++			lane(SlotResult, i) = lane(SlotPlain, i);
++		}
+ 	}
+-	// t3 and t4 are t2 when the form does not need them: save each register once.
+-	std::array<int, 4> saved {t1, t2};
+-	int                saved_count = 2;
+-	for (int t: {t3, t4}) {
+-		if (t != t2) {
+-			saved[saved_count++] = t;
++}
++
++// Constants for the exact FMA, a 32-byte row each.
++struct FmaConstants {
++	Xbyak::Label sign, abs, one, zero, negate_c;
++	// Double precision only.
++	Xbyak::Label infinity, split, min_product, min_input, rn_a, rn_b, rn_product, lanes;
++};
++
++using Row = std::array<uint64_t, 4>;
++
++constexpr Row Splat(uint64_t v) {
++	return {v, v, v, v};
++}
++
++// Puts rows of constants in the code, jumped over.
++void EmitRows(Xbyak::CodeGenerator& g, std::initializer_list<std::pair<Xbyak::Label*, Row>> rows) {
++	Xbyak::Label next;
++	g.jmp(next, Xbyak::CodeGenerator::T_NEAR);
++	g.align(32);
++	for (const auto& [label, row]: rows) {
++		g.L(*label);
++		for (uint64_t v: row) {
++			g.dq(v);
+ 		}
+ 	}
+-	const std::span<const int> saved_regs(saved.data(), saved_count);
+-	const int64_t              room = 32 * saved_count;
+-	e.Reserve(room);
+-	e.SaveVectors(saved_regs);
++	g.L(next);
++}
+ 
+-	// How the double-precision work is done: 4 doubles (packed single, 256-bit packed double),
+-	// 2 doubles (128-bit packed double) or one (scalar).
++// The sign bit in the lanes where the instruction subtracts c.
++Row SubtractedLanes(const FmaForm& form) {
++	constexpr uint64_t Sign = uint64_t {1} << 63;
++	Row                row {};
++	for (int i = 0; i < 4; ++i) {
++		const bool odd = (i & 1) != 0;
++		row[i] = form.subtract || (form.alternate == 1 && !odd) || (form.alternate == 2 && odd) ? Sign : 0;
++	}
++	return row;
++}
++
++// Double-precision vector work at one width: four lanes in YMM registers, two in XMM registers,
++// or only lane 0, with scalar arithmetic so that the other lane's leftovers raise nothing and
++// cost no microcode assists. Logic and blends act on whole registers.
++class FmaWork {
++public:
+ 	enum class Width { Y, X, Scalar };
+-	const Width width = form.scalar                ? Width::Scalar
+-	                    : form.single || wide      ? Width::Y
+-	                                               : Width::X;
+-
+-	// Loads part `part` (0: low 128 bits, 1: high 128 bits) of operand i into scratch t.
+-	const auto load = [&](int t, int i, int part) {
+-		const auto& op     = e.ops[i];
+-		const bool  memory = op.type == ZYDIS_OPERAND_TYPE_MEMORY;
+-		const int   reg    = memory ? 0 : VectorId(op.reg.value);
+-		if (form.single && !form.scalar) {
+-			if (memory) {
+-				e.Emit(ZYDIS_MNEMONIC_VCVTPS2PD, {RegOp(YmmReg(t)), e.Mem(i, 16 * part, 16)});
+-			} else if (part == 1) {
+-				e.g.vextractf128(Xbyak::Xmm(t), Xbyak::Ymm(reg), 1);
+-				e.g.vcvtps2pd(Xbyak::Ymm(t), Xbyak::Xmm(t));
+-			} else {
+-				e.g.vcvtps2pd(Xbyak::Ymm(t), Xbyak::Xmm(reg));
+-			}
+-		} else if (form.single) {
+-			e.Emit(ZYDIS_MNEMONIC_VCVTSS2SD, {RegOp(XmmReg(t)), RegOp(XmmReg(t)),
+-			                                  memory ? e.Mem(i, 0, 4) : RegOp(XmmReg(reg))});
+-		} else if (!form.scalar) {
+-			const auto dst = RegOp(wide ? YmmReg(t) : XmmReg(t));
+-			e.Emit(ZYDIS_MNEMONIC_VMOVUPD,
+-			       {dst, memory ? e.Mem(i, 0, wide ? 32 : 16)
+-			                    : RegOp(wide ? YmmReg(reg) : XmmReg(reg))});
+-		} else if (memory) {
+-			e.Emit(ZYDIS_MNEMONIC_VMOVSD, {RegOp(XmmReg(t)), e.Mem(i, 0, 8)});
++
++	FmaWork(Xbyak::CodeGenerator& g, Width width): g(g), width(width) {}
++
++	Xbyak::Xmm V(int t) const { return width == Width::Y ? Xbyak::Ymm(t) : Xbyak::Xmm(t); }
++
++	void Add(int d, int s, const Xbyak::Operand& o) {
++		Scalar() ? g.vaddsd(V(d), V(s), o) : g.vaddpd(V(d), V(s), o);
++	}
++	void Sub(int d, int s, const Xbyak::Operand& o) {
++		Scalar() ? g.vsubsd(V(d), V(s), o) : g.vsubpd(V(d), V(s), o);
++	}
++	void Mul(int d, int s, const Xbyak::Operand& o) {
++		Scalar() ? g.vmulsd(V(d), V(s), o) : g.vmulpd(V(d), V(s), o);
++	}
++	void Min(int d, int s, const Xbyak::Operand& o) {
++		Scalar() ? g.vminsd(V(d), V(s), o) : g.vminpd(V(d), V(s), o);
++	}
++	// Predicates, all quiet: no exception for a quiet NaN.
++	static constexpr uint8_t EqualOq = 0x00, UnorderedQ = 0x03, OrderedQ = 0x07, NotEqualOq = 0x0c,
++	                         LessOq = 0x11, GreaterEqualOq = 0x1d;
++	void Cmp(int d, int s, const Xbyak::Operand& o, uint8_t predicate) {
++		Scalar() ? g.vcmpsd(V(d), V(s), o, predicate) : g.vcmppd(V(d), V(s), o, predicate);
++	}
++	void And(int d, int s, const Xbyak::Operand& o) { g.vandpd(V(d), V(s), o); }
++	void AndNot(int d, int s, const Xbyak::Operand& o) { g.vandnpd(V(d), V(s), o); } // ~s & o.
++	void Or(int d, int s, const Xbyak::Operand& o) { g.vorpd(V(d), V(s), o); }
++	void Xor(int d, int s, const Xbyak::Operand& o) { g.vxorpd(V(d), V(s), o); }
++	void Blend(int d, int s, const Xbyak::Operand& o, int mask) { g.vblendvpd(V(d), V(s), o, V(mask)); }
++	void Load(int d, const Xbyak::Address& m) { g.vmovupd(V(d), m); }
++	void Store(const Xbyak::Address& m, int s) { g.vmovupd(m, V(s)); }
++	void Move(int d, int s) { g.vmovapd(V(d), V(s)); }
++
++	// s = p + c or p - c as the instruction combines them (VFMADDSUB subtracts in even lanes,
++	// VFMSUBADD in odd ones), with NaNs as AVX gives them. t: scratch for VFMSUBADD.
++	void Combine(const FmaForm& form, int s, int p, const Xbyak::Operand& c, int t) {
++		if (form.alternate == 1) {
++			g.vaddsubpd(V(s), V(p), c);
++		} else if (form.alternate == 2) {
++			Sub(t, p, c);
++			Add(s, p, c);
++			g.vblendpd(V(s), V(s), V(t), width == Width::Y ? 0b1010 : 0b10);
++		} else if (form.subtract) {
++			Sub(s, p, c);
+ 		} else {
+-			e.g.vmovapd(Xbyak::Xmm(t), Xbyak::Xmm(reg));
++			Add(s, p, c);
+ 		}
+-	};
++	}
+ 
+-	Xbyak::Label sign;
+-	if (form.negate_product) {
+-		Xbyak::Label next;
+-		e.g.jmp(next);
+-		e.g.align(8);
+-		e.g.L(sign);
+-		for (int i = 0; i < 4; ++i) {
+-			e.g.dq(0x8000000000000000ULL);
+-		}
+-		e.g.L(next);
++	// a = the exact error of s = a + b rounded to nearest (Knuth's TwoSum). b and t change.
++	void TwoSum(int a, int b, int s, int t) {
++		Sub(t, s, V(a)); // z = s - a
++		Sub(b, b, V(t)); // b - z
++		Sub(t, s, V(t)); // s - z
++		Sub(a, a, V(t)); // a - (s - z)
++		Add(a, a, V(b)); // the error
+ 	}
+ 
+-	// t1 = a * b +/- c in double precision for part `part`.
++	// s rounded to nearest becomes rounded to odd, from e = the exact value - s: where e is
++	// nonzero and s even, s moves one ulp toward e. (s | 1) - s is that ulp, signed like s (zero
++	// when s is odd), and takes e's sign; a blend keeps s exactly elsewhere (signed zeros too, in
++	// any rounding mode). NaN and infinite s have a NaN e and stay. t and u change.
++	void RoundToOdd(int s, int e, int t, int u, FmaConstants& k) {
++		Or(t, s, ptr[rip + k.one]);
++		Sub(u, t, V(s));                        // The ulp, signed like s.
++		Xor(t, e, V(s));
++		AndNot(t, t, ptr[rip + k.sign]);        // The sign bit where e and s agree.
++		Xor(u, u, V(t));                        // Minus the step toward e.
++		Sub(t, s, V(u));                        // s moved.
++		Cmp(u, e, ptr[rip + k.zero], NotEqualOq);
++		Blend(s, s, V(t), u);
++	}
++
++private:
++	bool Scalar() const { return width == Width::Scalar; }
++
++	Xbyak::CodeGenerator& g;
++	Width                 width;
++};
++
++// Single precision (see the FMA notes above): the sum in double precision, rounded to odd, then
++// to float.
++bool GenerateExactFmaSingle(Emitter& e, const FmaForm& form, bool wide, int a, int b, int c) {
++	const int          d     = VectorId(e.ops[0].reg.value);
++	const int          count = wide ? 5 : 4; // The fifth keeps the upper four floats.
++	std::array<int, 5> t {};
++	for (int i = 0; i < count; ++i) {
++		t[i] = e.Scratch();
++	}
++	if (!e.ok) {
++		return false;
++	}
++	const std::span<const int> saved(t.data(), count);
++	e.Reserve(32 * count);
++	e.SaveVectors(saved);
++
++	FmaWork      w(e.g, form.scalar ? FmaWork::Width::Scalar : FmaWork::Width::Y);
++	FmaConstants k;
++	EmitRows(e.g, {{&k.sign, Splat(uint64_t {1} << 63)},
++	               {&k.one, Splat(1)},
++	               {&k.zero, Splat(0)},
++	               {&k.negate_c, SubtractedLanes(form)}});
++	const bool negate_c = form.subtract || form.alternate != 0;
++
++	// t1 = a * b +/- c rounded to odd, for four elements (part 1: the upper four).
+ 	const auto compute = [&](int part) {
+-		const auto Y = [](int t) { return Xbyak::Ymm(t); };
+-		const auto X = [](int t) { return Xbyak::Xmm(t); };
+-		load(t1, a, part);
+-		load(t2, b, part);
+-		switch (width) {
+-			case Width::Y: e.g.vmulpd(Y(t1), Y(t1), Y(t2)); break;
+-			case Width::X: e.g.vmulpd(X(t1), X(t1), X(t2)); break;
+-			default: e.g.vmulsd(X(t1), X(t1), X(t2)); break;
+-		}
++		LoadFmaOperand(e, form, wide, t[0], a, part);
++		LoadFmaOperand(e, form, wide, t[1], b, part);
++		w.Mul(t[0], t[0], w.V(t[1])); // Exact.
+ 		if (form.negate_product) {
+ 			// Negate the product, except a NaN: FMA returns NaNs with their sign unchanged.
+-			if (width == Width::Y) {
+-				e.g.vcmpordpd(Y(t2), Y(t1), Y(t1));
+-				e.g.vandpd(Y(t2), Y(t2), ptr[rip + sign]);
+-				e.g.vxorpd(Y(t1), Y(t1), Y(t2));
+-			} else {
+-				e.g.vcmpordpd(X(t2), X(t1), X(t1));
+-				e.g.vandpd(X(t2), X(t2), ptr[rip + sign]);
+-				e.g.vxorpd(X(t1), X(t1), X(t2));
+-			}
++			w.Cmp(t[1], t[0], w.V(t[0]), FmaWork::OrderedQ);
++			w.And(t[1], t[1], ptr[rip + k.sign]);
++			w.Xor(t[0], t[0], w.V(t[1]));
+ 		}
+-		load(t2, c, part);
+-		if (form.alternate == 1) {
+-			// Even elements product - c, odd elements product + c: exactly VADDSUBPD.
+-			width == Width::Y ? e.g.vaddsubpd(Y(t1), Y(t1), Y(t2)) : e.g.vaddsubpd(X(t1), X(t1), X(t2));
+-			return;
+-		}
+-		if (form.alternate == 2) {
+-			// Even elements product + c, odd elements product - c.
+-			if (width == Width::Y) {
+-				e.g.vsubpd(Y(t4), Y(t1), Y(t2));
+-				e.g.vaddpd(Y(t1), Y(t1), Y(t2));
+-				e.g.vblendpd(Y(t1), Y(t1), Y(t4), 0b1010);
+-			} else {
+-				e.g.vsubpd(X(t4), X(t1), X(t2));
+-				e.g.vaddpd(X(t1), X(t1), X(t2));
+-				e.g.vblendpd(X(t1), X(t1), X(t4), 0b10);
+-			}
+-			return;
+-		}
+-		switch (width) {
+-			case Width::Y:
+-				form.subtract ? e.g.vsubpd(Y(t1), Y(t1), Y(t2)) : e.g.vaddpd(Y(t1), Y(t1), Y(t2));
+-				break;
+-			case Width::X:
+-				form.subtract ? e.g.vsubpd(X(t1), X(t1), X(t2)) : e.g.vaddpd(X(t1), X(t1), X(t2));
+-				break;
+-			default:
+-				form.subtract ? e.g.vsubsd(X(t1), X(t1), X(t2)) : e.g.vaddsd(X(t1), X(t1), X(t2));
+-				break;
++		LoadFmaOperand(e, form, wide, t[2], c, part);
++		w.Combine(form, t[1], t[0], w.V(t[2]), t[3]);
++		if (negate_c) {
++			w.Xor(t[2], t[2], ptr[rip + k.negate_c]); // What was added.
+ 		}
++		w.TwoSum(t[0], t[2], t[1], t[3]);
++		w.RoundToOdd(t[1], t[0], t[2], t[3], k);
++
++		// Where a and b are numbers and c is a NaN, c's NaN, also where a*b is 0 times infinity
++		// (the sum has the product's new NaN there). Off the path from the inputs to the sum.
++		LoadFmaOperand(e, form, wide, t[0], a, part);
++		LoadFmaOperand(e, form, wide, t[2], b, part);
++		w.Cmp(t[0], t[0], w.V(t[2]), FmaWork::OrderedQ);
++		LoadFmaOperand(e, form, wide, t[2], c, part);
++		w.Cmp(t[3], t[2], w.V(t[2]), FmaWork::UnorderedQ);
++		w.And(t[0], t[0], w.V(t[3]));
++		w.Blend(t[1], t[1], w.V(t[2]), t[0]);
+ 	};
+ 
+-	if (form.single && !form.scalar) {
+-		if (wide) {
+-			compute(1);
+-			e.g.vcvtpd2ps(Xbyak::Xmm(t3), Xbyak::Ymm(t1));
+-			compute(0);
+-			e.g.vcvtpd2ps(Xbyak::Xmm(d), Xbyak::Ymm(t1));
+-			e.g.vinsertf128(Xbyak::Ymm(d), Xbyak::Ymm(d), Xbyak::Xmm(t3), 1);
+-		} else {
+-			compute(0);
+-			e.g.vcvtpd2ps(Xbyak::Xmm(d), Xbyak::Ymm(t1));
+-		}
+-	} else if (form.single) {
++	if (form.scalar) {
+ 		compute(0);
+-		e.g.vcvtsd2ss(Xbyak::Xmm(d), Xbyak::Xmm(d), Xbyak::Xmm(t1));
+-	} else if (!form.scalar) {
++		e.g.vcvtsd2ss(Xbyak::Xmm(d), Xbyak::Xmm(d), Xbyak::Xmm(t[1]));
++	} else if (wide) {
++		compute(1);
++		e.g.vcvtpd2ps(Xbyak::Xmm(t[4]), Xbyak::Ymm(t[1]));
+ 		compute(0);
+-		if (wide) {
+-			e.g.vmovapd(Xbyak::Ymm(d), Xbyak::Ymm(t1));
+-		} else {
+-			e.g.vmovapd(Xbyak::Xmm(d), Xbyak::Xmm(t1));
+-		}
++		e.g.vcvtpd2ps(Xbyak::Xmm(d), Xbyak::Ymm(t[1]));
++		e.g.vinsertf128(Xbyak::Ymm(d), Xbyak::Ymm(d), Xbyak::Xmm(t[4]), 1);
+ 	} else {
+ 		compute(0);
+-		e.g.vmovsd(Xbyak::Xmm(d), Xbyak::Xmm(d), Xbyak::Xmm(t1));
++		e.g.vcvtpd2ps(Xbyak::Xmm(d), Xbyak::Ymm(t[1]));
+ 	}
+ 
+-	e.RestoreVectors(saved_regs);
+-	e.Release(room);
++	e.RestoreVectors(saved);
++	e.Release(32 * count);
+ 	return e.ok;
+ }
+ 
++// Double precision (see the FMA notes above): Dekker's product, TwoSum and rounding to odd in
++// the vector registers; lanes they cannot do exactly go to FmaFallback. What the result waits for
++// stays in registers; the frame holds what FmaFallback reads.
++bool GenerateExactFmaDouble(Emitter& e, const FmaForm& form, bool wide, int a, int b, int c) {
++	using Width           = FmaWork::Width;
++	const int     d       = VectorId(e.ops[0].reg.value);
++	const Width   width   = form.scalar ? Width::Scalar : wide ? Width::Y : Width::X;
++	const int     lanes   = form.scalar ? 1 : wide ? 4 : 2;
++	constexpr int Count   = 6;
++	std::array<int, Count> t {};
++	for (int& reg: t) {
++		reg = e.Scratch();
++	}
++	if (!e.ok) {
++		return false;
++	}
++	const auto [t0, t1, t2, t3, t4, t5] = t;
++
++	// [rsp] RFLAGS (the lane test and the fallback call change them), then the scratch registers
++	// and the frame.
++	constexpr int Saved = 8;
++	constexpr int Frame = Saved + Count * 32;
++	constexpr int Room  = Frame + FmaSlotCount * 32 - 8;
++	e.ReserveSavingFlags(Room);
++	for (int i = 0; i < Count; ++i) {
++		e.g.vmovdqu(ptr[rsp + Saved + 32 * i], Xbyak::Ymm(t[i]));
++	}
++	const auto slot = [](int s) { return ptr[rsp + Frame + 32 * s]; };
++	const auto load = [&](int reg, int operand) { LoadFmaOperand(e, form, wide, reg, operand, 0); };
++
++	FmaWork            w(e.g, width);
++	FmaConstants       k;
++	constexpr uint64_t Sign = uint64_t {1} << 63;
++	constexpr uint64_t Q    = 0x3ca8000000000000; // 0.75 ulp of 1.0
++	EmitRows(e.g, {{&k.sign, Splat(Sign)},
++	               {&k.abs, Splat(~Sign)},
++	               {&k.one, Splat(1)},
++	               {&k.zero, Splat(0)},
++	               {&k.negate_c, SubtractedLanes(form)},
++	               {&k.infinity, Splat(0x7ff0000000000000)},
++	               {&k.split, Splat(0x41a0000002000000)},       // 2^27 + 1
++	               {&k.min_product, Splat(0x0df0000000000000)}, // 2^-800
++	               {&k.min_input, Splat(0x03f0000000000000)},   // 2^-960
++	               {&k.rn_a, {0x3ff0000000000000, 0xbff0000000000000, 0x3ff0000000000000, 0xbff0000000000000}},
++	               {&k.rn_b, {Q, Q | Sign, Q, Q | Sign}},
++	               {&k.rn_product, Splat(0xbff0000000000002)}, // -(1 + 2^-51)
++	               {&k.lanes, {~uint64_t {0}, lanes > 1 ? ~uint64_t {0} : 0, lanes > 2 ? ~uint64_t {0} : 0,
++	                           lanes > 2 ? ~uint64_t {0} : 0}}});
++
++	// t4 = ph = a*b. Dekker: a = ah + al and b = bh + bl with halves of 26 bits, then t5 = pl =
++	// a*b - ph exactly as ((ah*bh - ph) + ah*bl + al*bh) + al*bl.
++	load(t0, a);
++	w.Store(slot(SlotA), t0);
++	load(t1, b);
++	w.Store(slot(SlotB), t1);
++	w.Mul(t4, t0, w.V(t1));
++	w.Mul(t2, t0, ptr[rip + k.split]);
++	w.Sub(t3, t2, w.V(t0));
++	w.Sub(t2, t2, w.V(t3)); // ah
++	w.Sub(t3, t0, w.V(t2)); // al
++	w.Mul(t0, t1, ptr[rip + k.split]);
++	w.Sub(t5, t0, w.V(t1));
++	w.Sub(t0, t0, w.V(t5)); // bh
++	w.Sub(t1, t1, w.V(t0)); // bl
++	w.Mul(t5, t2, w.V(t0));
++	w.Sub(t5, t5, w.V(t4));
++	w.Mul(t2, t2, w.V(t1));
++	w.Add(t5, t5, w.V(t2));
++	w.Mul(t2, t3, w.V(t0));
++	w.Add(t5, t5, w.V(t2));
++	w.Mul(t3, t3, w.V(t1));
++	w.Add(t5, t5, w.V(t3));
++
++	// Where every value below is normal (FTZ cannot flush one): min(|a|, |b|) and |c| (unless
++	// zero) at least 2^-960, |ph| at least 2^-800. A zero factor makes the plain result exact.
++	load(t0, a);
++	w.And(t0, t0, ptr[rip + k.abs]);
++	load(t1, b);
++	w.And(t1, t1, ptr[rip + k.abs]);
++	w.Min(t0, t0, w.V(t1));
++	w.Cmp(t1, t0, ptr[rip + k.zero], FmaWork::EqualOq);
++	w.Cmp(t0, t0, ptr[rip + k.min_input], FmaWork::GreaterEqualOq);
++	w.And(t2, t4, ptr[rip + k.abs]);
++	w.Cmp(t2, t2, ptr[rip + k.min_product], FmaWork::GreaterEqualOq);
++	w.And(t0, t0, w.V(t2));
++	load(t2, c);
++	w.Store(slot(SlotGuestC), t2);
++	w.And(t2, t2, ptr[rip + k.abs]);
++	w.Cmp(t3, t2, ptr[rip + k.zero], FmaWork::EqualOq);
++	w.Cmp(t2, t2, ptr[rip + k.min_input], FmaWork::GreaterEqualOq);
++	w.Or(t2, t2, w.V(t3));
++	w.And(t0, t0, w.V(t2));
++	w.Or(t0, t0, w.V(t1));
++	w.Store(slot(SlotOk), t0);
++
++	// The product negated (except a NaN, whose sign FMA keeps), then t2 = th = ph +/- c, the plain
++	// result, which has a's or b's NaN where there is one; (th, tl) = TwoSum(ph, c).
++	if (form.negate_product) {
++		w.Cmp(t1, t4, w.V(t4), FmaWork::OrderedQ);
++		w.And(t1, t1, ptr[rip + k.sign]);
++		w.Xor(t4, t4, w.V(t1));
++		w.Xor(t5, t5, ptr[rip + k.sign]);
++	}
++	w.Store(slot(SlotPl), t5);
++	load(t0, c);
++	w.Combine(form, t2, t4, w.V(t0), t3);
++	w.Store(slot(SlotPlain), t2);
++	if (form.subtract || form.alternate != 0) {
++		w.Xor(t0, t0, ptr[rip + k.negate_c]);
++	}
++	w.Store(slot(SlotC), t0);
++	w.TwoSum(t4, t0, t2, t3); // tl
++
++	// v = tl + pl rounded to odd; the result is t1 = v + th.
++	w.Add(t1, t4, w.V(t5));
++	w.TwoSum(t4, t5, t1, t3);
++	w.RoundToOdd(t1, t4, t0, t3, k);
++	w.Add(t1, t1, w.V(t2));
++
++	// Exact where the range checks hold, the result is finite and MXCSR rounds to nearest: only
++	// then is (1 + 0.75 ulp) * (-1 - 0.75 ulp) = -(1 + 2 ulp).
++	w.And(t0, t1, ptr[rip + k.abs]);
++	w.Cmp(t0, t0, ptr[rip + k.infinity], FmaWork::LessOq);
++	w.And(t0, t0, slot(SlotOk));
++	{
++		const Xbyak::Xmm x3 = width == Width::Y ? Xbyak::Ymm(t3) : Xbyak::Xmm(t3);
++		const Xbyak::Xmm x4 = width == Width::Y ? Xbyak::Ymm(t4) : Xbyak::Xmm(t4);
++		e.g.vmovupd(x4, ptr[rip + k.rn_a]);
++		e.g.vaddpd(x4, x4, ptr[rip + k.rn_b]);
++		e.g.vpermilpd(x3, x4, 0b0101); // Swaps neighbors.
++		e.g.vmulpd(x4, x4, x3);
++		e.g.vcmppd(x4, x4, ptr[rip + k.rn_product], FmaWork::EqualOq);
++	}
++	w.And(t0, t0, w.V(t4));
++	// Where a*b is exact (pl = 0), so is the plain result.
++	w.Load(t3, slot(SlotPl));
++	w.Cmp(t3, t3, ptr[rip + k.zero], FmaWork::EqualOq);
++	w.Blend(t1, t1, w.V(t2), t3);
++
++	// Any lane left goes to FmaFallback, with every register kept around the call (the host ABI
++	// may change any vector register).
++	Xbyak::Label done;
++	width == Width::Y ? e.g.vtestpd(Xbyak::Ymm(t0), ptr[rip + k.lanes])
++	                  : e.g.vtestpd(Xbyak::Xmm(t0), ptr[rip + k.lanes]);
++	e.g.jc(done, Xbyak::CodeGenerator::T_NEAR); // CF: no lane without its sign bit.
++	w.Store(slot(SlotResult), t1);
++	w.Store(slot(SlotOk), t0);
++	constexpr int Vectors = 16 * 32;
++	e.g.sub(rsp, Vectors);
++	for (int i = 0; i < 16; ++i) {
++		e.g.vmovdqu(ptr[rsp + 32 * i], Xbyak::Ymm(i));
++	}
++	const Xbyak::Reg64 kept[] = {rax, rcx, rdx, rsi, rdi, r8, r9, r10, r11, rbp};
++	for (const auto& reg: kept) {
++		e.g.push(reg);
++	}
++	constexpr int Pushed = static_cast<int>(std::size(kept)) * 8;
++#ifdef _WIN32
++	const Xbyak::Reg64 arg0 = rcx;
++	const Xbyak::Reg32 arg1 = edx;
++#else
++	const Xbyak::Reg64 arg0 = rdi;
++	const Xbyak::Reg32 arg1 = esi;
++#endif
++	e.g.lea(arg0, ptr[rsp + Pushed + Vectors + Frame]);
++	e.g.mov(arg1, static_cast<uint32_t>(lanes | (form.negate_product ? 8 : 0)));
++	e.g.mov(rbp, rsp);
++	e.g.and_(rsp, -16);
++#ifdef _WIN32
++	e.g.sub(rsp, 32); // The callee's shadow space.
++#endif
++	e.g.mov(rax, reinterpret_cast<uint64_t>(&FmaFallback));
++	e.g.call(rax);
++	e.g.mov(rsp, rbp);
++	for (int i = static_cast<int>(std::size(kept)) - 1; i >= 0; --i) {
++		e.g.pop(kept[i]);
++	}
++	for (int i = 0; i < 16; ++i) {
++		e.g.vmovdqu(Xbyak::Ymm(i), ptr[rsp + 32 * i]);
++	}
++	e.g.add(rsp, Vectors);
++	w.Load(t1, slot(SlotResult));
++	e.g.L(done);
++
++	switch (width) {
++		case Width::Y: e.g.vmovapd(Xbyak::Ymm(d), Xbyak::Ymm(t1)); break;
++		case Width::X: e.g.vmovapd(Xbyak::Xmm(d), Xbyak::Xmm(t1)); break;
++		default: e.g.vmovsd(Xbyak::Xmm(d), Xbyak::Xmm(d), Xbyak::Xmm(t1)); break;
++	}
++	for (int i = 0; i < Count; ++i) {
++		e.g.vmovdqu(Xbyak::Ymm(t[i]), ptr[rsp + Saved + 32 * i]);
++	}
++	e.ReleaseSavingFlags(Room);
++	return e.ok;
++}
++
++bool GenerateFma(Emitter& e) {
++	FmaForm form;
++	if (!GetFmaForm(e.in.mnemonic, &form) || e.in.operand_count_visible != 3 ||
++	    e.ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER || e.ops[1].type != ZYDIS_OPERAND_TYPE_REGISTER) {
++		return false;
++	}
++	const bool wide = IsYmm(e.ops[0].reg.value);
++	if (wide && form.scalar) {
++		return false;
++	}
++	if (FastFma()) {
++		return GenerateFastFma(e, form, wide);
++	}
++	// product = a * b, result = product +/- c (operand indexes).
++	int a = 0;
++	int b = 0;
++	int c = 0;
++	switch (form.order) {
++		case 132: a = 0, b = 2, c = 1; break;
++		case 213: a = 1, b = 0, c = 2; break;
++		default: a = 1, b = 2, c = 0; break;
++	}
++	return form.single ? GenerateExactFmaSingle(e, form, wide, a, b, c)
++	                   : GenerateExactFmaDouble(e, form, wide, a, b, c);
++}
++
+ // ---------------------------------------------------------------------------------------------
+ // Gathers (VGATHER*, VPGATHER*), one element at a time: each element whose mask element has its
+ // top bit set is loaded from base + index[i] * scale + displacement; the others keep their old
+diff --git a/src/loader/jaguarCompat.h b/src/loader/jaguarCompat.h
+--- a/src/loader/jaguarCompat.h
++++ b/src/loader/jaguarCompat.h
+@@ -22,10 +22,10 @@ bool Enabled();
+ // instructions at load time, make them fault, so that every one goes through the run-time path.
+ bool TrapTest();
+ 
+-// FMA replacements: by default single precision is computed in double precision, which is the
+-// fused result except in very rare cases. KYTY_JAGUAR_FMA=fast makes every FMA a multiply and an
+-// add at its own precision, each rounded, as code built without FMA would compute it: several
+-// times cheaper, but results can differ from the PS5's (most where the sum cancels).
++// FMA replacements: by default the result is the fused one, bit for bit, as the PS5 computes it,
++// in every MXCSR rounding mode and with FTZ or DAZ. KYTY_JAGUAR_FMA=fast makes every FMA a
++// multiply and an add at its own precision, each rounded, as code built without FMA would compute
++// it: several times cheaper, but results can differ from the PS5's (most where the sum cancels).
+ 
+ // Whether the instruction needs AVX2, FMA, BMI2 or another extension the PS4's CPU lacks
+ // (RDRAND, RDSEED, ADX, CLFLUSHOPT).

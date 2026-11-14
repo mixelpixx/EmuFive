@@ -4,8 +4,9 @@
 // natively and as its replacement from the same random state, and all registers, flags and
 // memory must match. It also checks that no replacement uses AVX2, FMA or BMI2 itself.
 //   jaguarTest [-n instances-per-form] [-r runs] code.bin...
-// With KYTY_JAGUAR_FMA=fast, FMA destinations are checked against a multiply then an add (each
-// rounded) instead of the fused native result.
+// FMA results must match the fused native ones bit for bit, and a quarter of the FMA runs use a
+// random MXCSR rounding mode, FTZ and DAZ. With KYTY_JAGUAR_FMA=fast, FMA destinations are
+// checked against a multiply then an add (each rounded) instead, with the default MXCSR.
 
 #include "loader/jaguarCompat.h"
 
@@ -22,6 +23,7 @@
 #include <string>
 #include <vector>
 #include <xbyak/xbyak.h>
+#include <xmmintrin.h>
 #ifdef _WIN32
 #include <windows.h>
 #else
@@ -39,7 +41,9 @@ struct State {
 	uint64_t gpr[16];
 	uint64_t flags;
 	uint64_t host_rsp;
-	uint64_t pad[6];
+	uint32_t mxcsr;      // While the code runs.
+	uint32_t host_mxcsr; // The runner's, back afterwards.
+	uint64_t pad[5];
 	uint8_t  ymm[16][32];
 };
 
@@ -133,6 +137,7 @@ static void RestoreHost(Xbyak::CodeGenerator& g) {
 	}
 	g.add(rsp, XmmSaveSize);
 #endif
+	g.ldmxcsr(At(&g_state->host_mxcsr));
 	for (int i = static_cast<int>(std::size(g_host_saved)) - 1; i >= 0; --i) {
 		g.pop(g_host_saved[i]);
 	}
@@ -148,6 +153,8 @@ static void BuildRunner(Xbyak::CodeGenerator& g, Body body) {
 	g.reset();
 	SaveHost(g);
 	g.mov(At(&g_state->host_rsp), rsp);
+	g.stmxcsr(At(&g_state->host_mxcsr));
+	g.ldmxcsr(At(&g_state->mxcsr));
 	for (int i = 0; i < 16; ++i) {
 		g.vmovdqu(Xbyak::Ymm(i), At(g_state->ymm[i]));
 	}
@@ -299,7 +306,7 @@ static std::string FormOf(const ZydisDecodedInstruction& in, const ZydisDecodedO
 }
 
 struct Result {
-	long runs = 0, failures = 0, inexact = 0, faults = 0, unsupported = 0, bad_isa = 0;
+	long runs = 0, failures = 0, faults = 0, unsupported = 0, bad_isa = 0;
 	long in_place = 0; // Instances with a same-length rewrite (also tested).
 	std::string first_failure;
 };
@@ -552,11 +559,19 @@ int main(int argc, char** argv) {
 						}
 					}
 					s.flags = 0x202 | (rng() & Status);
+					// A quarter of the exact FMA runs in a random rounding mode, with or without FTZ
+					// and DAZ (exceptions stay masked).
+					s.mxcsr = 0x1f80;
+					if (fma && !fast_fma && rng() % 4 == 0) {
+						s.mxcsr |= static_cast<uint32_t>(rng() % 4) << 13;
+						s.mxcsr |= rng() % 2 != 0 ? 0x8000 : 0;
+						s.mxcsr |= rng() % 2 != 0 ? 0x40 : 0;
+					}
 					for (auto& reg: s.ymm) {
 						for (int lane = 0; lane < 8; ++lane) {
 							uint32_t v = 0;
 							float    fv;
-							switch (rng() % 6) {
+							switch (rng() % 7) {
 								case 0: v = rng() % 70; break;
 								case 1: v = static_cast<uint32_t>(rng()); break;
 								case 2:
@@ -571,7 +586,31 @@ int main(int argc, char** argv) {
 									break;
 								}
 								case 4: {
+									// Doubles take an even lane and the one after it (and stay
+									// inside the register).
+									if (lane % 2 != 0) {
+										v = static_cast<uint32_t>(rng());
+										break;
+									}
 									double d = std::uniform_real_distribution<double>(-100, 100)(rng);
+									memcpy(reg + lane * 4, &d, 8);
+									lane++;
+									continue;
+								}
+								case 5: {
+									// Double-precision edge cases: infinities, NaNs with payloads,
+									// subnormals, the largest and smallest exponents.
+									if (lane % 2 != 0) {
+										v = static_cast<uint32_t>(rng());
+										break;
+									}
+									static const uint64_t special[] = {
+									    0x7ff0000000000000, 0x7ff8000000000000, 0x7ff0000000000123,
+									    0x7ff80000abcdef00, 0x0000000000000001, 0x000fffffffffffff,
+									    0x0010000000000000, 0x7fefffffffffffff, 0x7e5a3c1f00000000,
+									    0x01a5c3e100000000};
+									const uint64_t sign = rng() % 2 != 0 ? uint64_t {1} << 63 : 0;
+									const uint64_t d    = special[rng() % 10] | sign;
 									memcpy(reg + lane * 4, &d, 8);
 									lane++;
 									continue;
@@ -650,6 +689,7 @@ int main(int argc, char** argv) {
 						}
 #else
 						if (sigsetjmp(g_jump, 1) != 0) {
+							_mm_setcsr(g_state->host_mxcsr); // The fault skipped the runner's restore.
 							return false;
 						}
 						reinterpret_cast<void (*)()>(code)();
@@ -751,42 +791,31 @@ int main(int argc, char** argv) {
 								continue;
 							}
 							if (memcmp(state0.ymm[r], state1.ymm[r], 32) != 0) {
-								// FMA in single precision may differ in the last bit in rare cases.
-								bool close = fma;
-								for (int lane = 0; close && lane < 8; ++lane) {
-									int32_t a, b;
-									memcpy(&a, state0.ymm[r] + lane * 4, 4);
-									memcpy(&b, state1.ymm[r] + lane * 4, 4);
-									// 64-bit: `long` is 32 bits on Windows.
-									if (std::llabs(int64_t {a} - int64_t {b}) > 1) {
-										close = false;
-									}
+								why = "ymm" + std::to_string(r) + " differs";
+								if (s.mxcsr != 0x1f80) {
+									char buf[32];
+									snprintf(buf, sizeof buf, " (mxcsr %04x)", s.mxcsr);
+									why += buf;
 								}
-								if (close) {
-									result.inexact++;
-								} else {
-									why = "ymm" + std::to_string(r) + " differs";
-									if (only != nullptr) {
-										printf("%s: ymm%d\n", form.c_str(), r);
-										for (int q = 0; q < 16; ++q) {
-											printf(" in ymm%-2d", q);
-											for (int lane = 0; lane < 4; ++lane) {
-												uint32_t v;
-												memcpy(&v, s.ymm[q] + lane * 4, 4);
-												printf(" %08x", v);
-											}
-											printf("\n");
+								if (only != nullptr) {
+									// Lanes from the highest down, as 64-bit values.
+									const auto print = [](const char* label, const uint8_t* ymm) {
+										printf(" %s", label);
+										for (int lane = 3; lane >= 0; --lane) {
+											uint64_t v;
+											memcpy(&v, ymm + lane * 8, 8);
+											printf(" %016llx", static_cast<unsigned long long>(v));
 										}
-										for (const auto* st: {&state0, &state1}) {
-											printf(" out     ");
-											for (int lane = 0; lane < 4; ++lane) {
-												uint32_t v;
-												memcpy(&v, st->ymm[r] + lane * 4, 4);
-												printf(" %08x", v);
-											}
-											printf("\n");
-										}
+										printf("\n");
+									};
+									printf("%s: ymm%d, mxcsr %04x\n", form.c_str(), r, s.mxcsr);
+									for (int q = 0; q < 16; ++q) {
+										char label[16];
+										snprintf(label, sizeof label, "in ymm%-2d", q);
+										print(label, s.ymm[q]);
 									}
+									print("native  ", state0.ymm[r]);
+									print("replaced", state1.ymm[r]);
 								}
 							}
 						}
@@ -810,24 +839,20 @@ int main(int argc, char** argv) {
 		}
 	}
 
-	long forms_ok = 0, forms_bad = 0, runs_total = 0, inexact_total = 0, in_place_total = 0;
+	long forms_ok = 0, forms_bad = 0, runs_total = 0, in_place_total = 0;
 	for (const auto& [form, r]: results) {
 		runs_total += r.runs;
 		in_place_total += r.in_place;
-		inexact_total += r.inexact;
 		const bool bad = r.failures || r.unsupported || r.bad_isa;
 		bad ? ++forms_bad : ++forms_ok;
-		if (bad || r.faults || r.inexact) {
-			printf("%-40s runs=%-6ld fail=%-4ld unsupported=%-3ld bad_isa=%-3ld inexact=%-4ld "
-			       "native_faults=%-3ld %s\n",
-			       form.c_str(), r.runs, r.failures, r.unsupported, r.bad_isa, r.inexact, r.faults,
+		if (bad || r.faults) {
+			printf("%-40s runs=%-6ld fail=%-4ld unsupported=%-3ld bad_isa=%-3ld native_faults=%-3ld %s\n",
+			       form.c_str(), r.runs, r.failures, r.unsupported, r.bad_isa, r.faults,
 			       r.first_failure.c_str());
 		}
 	}
-	printf("\nforms: %zu (%ld pass, %ld fail), instances: %ld (%ld rewritten in place), runs: %ld, "
-	       "inexact FMA lanes: %ld\n",
-	       results.size(), forms_ok, forms_bad, total_instances, in_place_total, runs_total,
-	       inexact_total);
+	printf("\nforms: %zu (%ld pass, %ld fail), instances: %ld (%ld rewritten in place), runs: %ld\n",
+	       results.size(), forms_ok, forms_bad, total_instances, in_place_total, runs_total);
 	if (segment_skipped != 0) {
 		printf("skipped: %ld forms with a segment whose base this host does not expose\n",
 		       segment_skipped);
