@@ -14,13 +14,47 @@ A PS5 emulator for the PS4.
 
 Created by **[Chokri Hammedi (blue0x1)](https://github.com/blue0x1)**. Built on [PS4 Multiboot](https://github.com/blue0x1/ps4-multiboot).
 
+> [!IMPORTANT]
+> **This is a fork, [mixelpixx/EmuFive](https://github.com/mixelpixx/EmuFive), and work on it goes on.** It merges every upstream release and adds its own fixes to the layer that runs PS5 code on the PS4's CPU (KytyPS5 patches `0008` and up). Upstream chose not to take these patches, so they continue here. See the [fork updates](#fork-updates). **Testers wanted:** [how to help](#testers-wanted).
+
 > **Status: experimental research.** On a PS4 Pro, "Sons of Sparta" runs at about 40 FPS and more. KytyPS5 rewrites the PS5-only CPU instructions in game code (patch `0004`). Other games are still being tested, and many are slow for now. See [The CPU problem](#the-cpu-problem).
 
 <p align="center"><img src="assets/home-screen.png" alt="The EmuFive home screen on a PS4 Pro, with God of War Sons of Sparta selected" width="900"></p>
 
 <p align="center">
-  <b><a href="#installing">Installing</a></b> · <b><a href="#games">Games</a></b> · <b><a href="#changelog">Changelog</a></b> · <a href="#how-it-works">How it works</a> · <a href="#the-cpu-problem">The CPU problem</a> · <a href="#plan">Plan</a> · <a href="#building">Building</a> · <a href="#credits">Credits</a>
+  <b><a href="#fork-updates">Fork updates</a></b> · <b><a href="#testers-wanted">Testers wanted</a></b> · <b><a href="#installing">Installing</a></b> · <b><a href="#games">Games</a></b> · <b><a href="#changelog">Changelog</a></b> · <a href="#how-it-works">How it works</a> · <a href="#the-cpu-problem">The CPU problem</a> · <a href="#plan">Plan</a> · <a href="#building">Building</a> · <a href="#credits">Credits</a>
 </p>
+
+## Fork updates
+
+Newest first. The patches are in [`patches/kytyps5/`](patches/kytyps5/). Each was checked on a PC against the real instructions with [`tools/jaguar-test/`](tools/jaguar-test/); none has run on a PS4 yet.
+
+| Date | Patches | Change |
+|---|---|---|
+| 2026-11-14 | `0018` | FMA gives the PS5's result bit for bit, in every rounding mode and with FTZ and DAZ. It was a multiply and an add in double precision, rounded twice. This costs 3 to 4 times as much as `KYTY_JAGUAR_FMA=fast`, which is still there. |
+| 2026-11-14 | | Upstream EmuFive 1.0.5 and 1.0.6 merged in. |
+| 2026-11-13 | `0016`, `0017` | Instructions that read thread-local storage (an FS or GS memory operand) are replaced instead of crashing. Replacements save the flags with LAHF/SAHF instead of PUSHFQ/POPFQ, about 5 times cheaper on the PS4's CPU. |
+| 2026-11-13 | `0014`, `0015` | `KYTY_JAGUAR_FMA=fast`: each FMA becomes a multiply and an add, much cheaper but not bit-exact. Gathers skip the mask tests when every element is selected. Per-element shifts (VPSLLVD and the others) run in SIMD. |
+| 2026-11-13 | `0008` to `0013` | Crash fixes: the guest TSC no longer uses BMI2; PDEP, PEXT, 256-bit VMPSADBW, RDRAND, RDSEED, ADX and CLFLUSHOPT get replacements; a race in the run-time path is fixed. Flags are saved only where they are live, and AVX2 instructions with a same-length AVX twin are rewritten in place. |
+
+## Testers wanted
+
+These patches have only been checked on a PC so far. If you run EmuFive on a PS4, PS4 Slim or PS4 Pro, please try this fork's emulator with your games:
+
+1. Build it on a Linux PC with Docker: `scripts/build-kyty.sh` makes `out/kytyps5-ps4.tar.xz` (see [Building](#building)). There is no ready-made download yet.
+2. Turn on SSH in Settings, then copy it to the PS4 and swap it in:
+
+   ```bash
+   scp out/kytyps5-ps4.tar.xz ps5@<PS4 address>:/tmp/
+   ssh ps5@<PS4 address>
+   sudo mv /opt/kytyps5 /opt/kytyps5.official
+   sudo tar -C /opt -xJf /tmp/kytyps5-ps4.tar.xz
+   ```
+
+   To go back: `sudo rm -rf /opt/kytyps5 && sudo mv /opt/kytyps5.official /opt/kytyps5`. A Software update that brings a new emulator puts the official one back.
+3. Open an [issue here](https://github.com/mixelpixx/EmuFive/issues) with the game and its title ID, your console model, how it ran (FPS, or where it stopped), and `~/kytyps5.log` if it crashed.
+
+Most useful: games that stop on the official build with "Illegal instruction" or another CPU error, and how fast games run now. With a PC, you can help too: build `tools/jaguar-test/` and run `jaguarTest` and `fmaStress` on your CPU, and report any difference with the CPU model.
 
 ## How it works
 
@@ -31,6 +65,7 @@ Created by **[Chokri Hammedi (blue0x1)](https://github.com/blue0x1)**. Built on 
   - `0002`: a C library for homebrew. PS5 homebrew built with the ps5-native-app-boilerplate ships a stand-in `sce_module/libc.prx` whose functions all return 0 (the console uses its own C library), so in KytyPS5 its `malloc` failed. The patch adds the C library functions such homebrew imports and uses them only for such a stand-in module.
   - `0003`: more for homebrew: files and folders, system calls, the foreground user, and extra mounts (`KYTY_MOUNTS`).
   - `0004`: PS5 code on the PS4's CPU. Every AVX2, FMA and BMI2 instruction is rewritten into SSE4.2/AVX/BMI1 code when a module loads; one that cannot be rewritten there is replaced the first time it runs. See [The CPU problem](#the-cpu-problem).
+  - `0008` and up: this fork's fixes and speedups to `0004`'s replacements. See [Fork updates](#fork-updates).
 - **EmuFive** packs all of it into a small Linux system that boots straight into the emulator, full screen, with no desktop. It installs through PS4 Multiboot like any other system.
 
 ## The CPU problem
@@ -151,7 +186,7 @@ Tested games:
 | Vampire Survivors | PS4 Slim | Playable, stable 60 FPS |
 | Spider-Man 2 | | Not tested yet |
 
-Tested a game? Open an [issue](https://github.com/blue0x1/EmuFive/issues) with the game, your console model and how it ran.
+Tested a game? Open an [issue](https://github.com/blue0x1/EmuFive/issues) with the game, your console model and how it ran. With this fork's emulator, open it [here](https://github.com/mixelpixx/EmuFive/issues) instead.
 
 ## Changelog
 

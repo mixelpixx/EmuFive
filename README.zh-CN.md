@@ -14,6 +14,9 @@
 
 作者：**[Chokri Hammedi (blue0x1)](https://github.com/blue0x1)**。基于 [PS4 Multiboot](https://github.com/blue0x1/ps4-multiboot) 构建。
 
+> [!IMPORTANT]
+> **这是一个分支：[mixelpixx/EmuFive](https://github.com/mixelpixx/EmuFive)，开发仍在继续。** 它合并上游的每个版本，并为在 PS4 CPU 上运行 PS5 代码的那一层加入自己的修复（KytyPS5 补丁 `0008` 及以后）。上游选择不接受这些补丁，所以它们在这里继续。**招募测试者：** 更新列表和测试方法见[英文 README](README.md#fork-updates)。
+
 > **状态：实验性研究。** 在 PS4 Pro 上，《Sons of Sparta》可以达到约 40 FPS 或更高。KytyPS5 会改写游戏代码中 PS5 专有的 CPU 指令（补丁 `0004`）。其他游戏仍在测试中，目前很多运行较慢。请参阅 [CPU 问题](#the-cpu-problem)。
 
 <p align="center"><img src="assets/home-screen.png" alt="PS4 Pro 上的 EmuFive 主屏幕，选中了 God of War Sons of Sparta" width="900"></p>
