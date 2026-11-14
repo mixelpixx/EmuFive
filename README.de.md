@@ -14,6 +14,9 @@ Ein PS5-Emulator für die PS4.
 
 Erstellt von **[Chokri Hammedi (blue0x1)](https://github.com/blue0x1)**. Basiert auf [PS4 Multiboot](https://github.com/blue0x1/ps4-multiboot).
 
+> [!IMPORTANT]
+> **Dies ist ein Fork, [mixelpixx/EmuFive](https://github.com/mixelpixx/EmuFive), und die Arbeit daran geht weiter.** Er übernimmt jede Upstream-Version und ergänzt eigene Korrekturen an der Schicht, die PS5-Code auf der CPU der PS4 ausführt (KytyPS5-Patches ab `0008`). Upstream hat sich entschieden, diese Patches nicht zu übernehmen, deshalb geht es hier weiter. **Tester gesucht:** Die Liste der Updates und die Anleitung zum Testen stehen in der [englischen README](README.md#fork-updates).
+
 > **Status: experimentelle Forschung.** Auf einer PS4 Pro läuft „Sons of Sparta“ mit etwa 40 FPS und mehr. KytyPS5 schreibt die PS5-eigenen CPU-Befehle im Spielcode um (Patch `0004`). Andere Spiele werden noch getestet, und viele sind vorerst langsam. Siehe [Das CPU-Problem](#the-cpu-problem).
 
 <p align="center"><img src="assets/home-screen.png" alt="Der EmuFive-Startbildschirm auf einer PS4 Pro, mit God of War Sons of Sparta ausgewählt" width="900"></p>
