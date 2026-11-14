@@ -27,10 +27,11 @@ Created by **[Chokri Hammedi (blue0x1)](https://github.com/blue0x1)**. Built on 
 
 ## Fork updates
 
-Newest first. The patches are in [`patches/kytyps5/`](patches/kytyps5/). Each was checked on a PC against the real instructions with [`tools/jaguar-test/`](tools/jaguar-test/); none has run on a PS4 yet.
+Newest first. The patches are in [`patches/kytyps5/`](patches/kytyps5/). The CPU patches were checked on a PC against the real instructions with [`tools/jaguar-test/`](tools/jaguar-test/), and `0019` with KytyPS5's GPU tests on a PC; none has run on a PS4 yet.
 
 | Date | Patches | Change |
 |---|---|---|
+| 2026-11-14 | `0019` | Games that draw with mesh shaders can run on GPUs without them, like the PS4's ([upstream #25](https://github.com/blue0x1/EmuFive/issues/25)). Each mesh shader runs as a compute shader that writes its triangles to GPU memory, which a normal draw then reads. This turns on by itself when the GPU lacks `VK_EXT_mesh_shader`; `KYTY_MESH_COMPUTE=1` forces it, for testing on a PC. Limits: indirect mesh draws read their arguments on the CPU, the layer of a layered render target is picked per vertex, and one draw's output must fit in 128 MiB (bigger draws are skipped, with a warning in the log). |
 | 2026-11-14 | `0018` | FMA gives the PS5's result bit for bit, in every rounding mode and with FTZ and DAZ. It was a multiply and an add in double precision, rounded twice. This costs 3 to 4 times as much as `KYTY_JAGUAR_FMA=fast`, which is still there. |
 | 2026-11-14 | | Upstream EmuFive 1.0.5 and 1.0.6 merged in. |
 | 2026-11-13 | `0016`, `0017` | Instructions that read thread-local storage (an FS or GS memory operand) are replaced instead of crashing. Replacements save the flags with LAHF/SAHF instead of PUSHFQ/POPFQ, about 5 times cheaper on the PS4's CPU. |
@@ -65,7 +66,7 @@ Most useful: games that stop on the official build with "Illegal instruction" or
   - `0002`: a C library for homebrew. PS5 homebrew built with the ps5-native-app-boilerplate ships a stand-in `sce_module/libc.prx` whose functions all return 0 (the console uses its own C library), so in KytyPS5 its `malloc` failed. The patch adds the C library functions such homebrew imports and uses them only for such a stand-in module.
   - `0003`: more for homebrew: files and folders, system calls, the foreground user, and extra mounts (`KYTY_MOUNTS`).
   - `0004`: PS5 code on the PS4's CPU. Every AVX2, FMA and BMI2 instruction is rewritten into SSE4.2/AVX/BMI1 code when a module loads; one that cannot be rewritten there is replaced the first time it runs. See [The CPU problem](#the-cpu-problem).
-  - `0008` and up: this fork's fixes and speedups to `0004`'s replacements. See [Fork updates](#fork-updates).
+  - `0008` to `0018`: this fork's fixes and speedups to `0004`'s replacements. `0019`: mesh shaders on the PS4's GPU. See [Fork updates](#fork-updates).
 - **EmuFive** packs all of it into a small Linux system that boots straight into the emulator, full screen, with no desktop. It installs through PS4 Multiboot like any other system.
 
 ## The CPU problem
