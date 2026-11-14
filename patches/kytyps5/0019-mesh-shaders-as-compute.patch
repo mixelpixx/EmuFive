@@ -1,0 +1,1177 @@
+From: mixelpixx <11727006+mixelpixx@users.noreply.github.com>
+Subject: [PATCH] graphics: mesh shaders as compute without VK_EXT_mesh_shader
+
+Hosts without VK_EXT_mesh_shader, such as the PS4's GCN2 GPU under RADV,
+could not run games that draw with mesh shaders. There the recompiler
+emits the mesh program as a compute shader that writes its vertices and
+triangle indices to the GPU-only utility buffer, and a generated vertex
+shader draws them with an indexed draw. KYTY_MESH_COMPUTE=1 forces this
+path on hosts that have the extension.
+
+Indirect mesh draws read their records on the CPU in this mode, and Layer
+is chosen per vertex rather than per primitive.
+---
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -731,6 +731,11 @@ if(BUILD_TESTING)
+ 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --alignbyte-only)
+ 	add_test(NAME graphics_pipeline_rasterization
+ 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --polygon-mode-only)
++	# The same draws with mesh shaders run as compute, as on hosts without VK_EXT_mesh_shader.
++	add_test(NAME graphics_pipeline_rasterization_mesh_compute
++		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --polygon-mode-only)
++	set_tests_properties(graphics_pipeline_rasterization_mesh_compute
++		PROPERTIES ENVIRONMENT KYTY_MESH_COMPUTE=1)
+ 	add_test(NAME graphics_draw_offsets
+ 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-offset-only)
+ 	add_test(NAME virtual_memory_allocation
+diff --git a/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp b/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp
+--- a/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp
++++ b/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp
+@@ -1,4 +1,5 @@
+ #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
++#include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
+ 
+ #include "common/assert.h"
+ #include "common/debugCounters.h"
+@@ -29,6 +30,7 @@
+ #include <cctype>
+ #include <chrono>
+ #include <cstdio>
++#include <cstdlib>
+ #include <cstring>
+ #include <fmt/format.h>
+ #include <limits>
+@@ -132,36 +134,6 @@ void DumpShader(std::span<const uint32_t> words, const std::string& name) {
+ 	file.Write(words.data(), words.size_bytes());
+ }
+ 
+-void ValidateShaderSpirv(const char* stage, uint64_t shader_hash,
+-                         const std::vector<uint32_t>& spirv, bool maintenance8_enabled) {
+-	if (!Config::ShaderValidationEnabled()) {
+-		return;
+-	}
+-	spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_3);
+-	std::string          messages;
+-	tools.SetMessageConsumer([&messages](spv_message_level_t, const char*,
+-	                                     const spv_position_t& position, const char* message) {
+-		messages += fmt::format("{}: {} ({}) {}\n", static_cast<int>(position.line),
+-		                        static_cast<int>(position.column), static_cast<int>(position.index),
+-		                        message);
+-	});
+-	spvtools::ValidatorOptions validator_options;
+-	validator_options.SetAllowOffsetTextureOperand(maintenance8_enabled);
+-	if (tools.Validate(spirv.data(), spirv.size(), validator_options)) {
+-		return;
+-	}
+-	spvtools::SpirvTools disassembler(SPV_ENV_VULKAN_1_2);
+-	std::string          text;
+-	disassembler.Disassemble(spirv, &text,
+-	                         static_cast<uint32_t>(SPV_BINARY_TO_TEXT_OPTION_NO_HEADER) |
+-	                             static_cast<uint32_t>(SPV_BINARY_TO_TEXT_OPTION_FRIENDLY_NAMES) |
+-	                             static_cast<uint32_t>(SPV_BINARY_TO_TEXT_OPTION_COMMENT) |
+-	                             static_cast<uint32_t>(SPV_BINARY_TO_TEXT_OPTION_INDENT) |
+-	                             static_cast<uint32_t>(SPV_BINARY_TO_TEXT_OPTION_COLOR));
+-	LOGF("%s\n", text.c_str());
+-	EXIT("ShaderRecompiler %s SPIR-V validation failed hash=0x%016" PRIx64 ":\n%s", stage,
+-	     shader_hash, messages.c_str());
+-}
+ 
+ // Formats with a narrower host variant drop the components the shader does not read.
+ vk::Format NarrowInputFormat(vk::Format format, uint32_t used_components) {
+@@ -234,6 +206,42 @@ std::vector<vk::Format> VertexInputFormats(const ShaderVertexInputInfo&
+ 
+ } // namespace
+ 
++void ValidateShaderSpirv(const char* stage, uint64_t shader_hash,
++                         const std::vector<uint32_t>& spirv, bool maintenance8_enabled) {
++	if (!Config::ShaderValidationEnabled()) {
++		return;
++	}
++	spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_3);
++	std::string          messages;
++	tools.SetMessageConsumer([&messages](spv_message_level_t, const char*,
++	                                     const spv_position_t& position, const char* message) {
++		messages += fmt::format("{}: {} ({}) {}\n", static_cast<int>(position.line),
++		                        static_cast<int>(position.column), static_cast<int>(position.index),
++		                        message);
++	});
++	spvtools::ValidatorOptions validator_options;
++	validator_options.SetAllowOffsetTextureOperand(maintenance8_enabled);
++	if (tools.Validate(spirv.data(), spirv.size(), validator_options)) {
++		return;
++	}
++	spvtools::SpirvTools disassembler(SPV_ENV_VULKAN_1_2);
++	std::string          text;
++	disassembler.Disassemble(spirv, &text,
++	                         static_cast<uint32_t>(SPV_BINARY_TO_TEXT_OPTION_NO_HEADER) |
++	                             static_cast<uint32_t>(SPV_BINARY_TO_TEXT_OPTION_FRIENDLY_NAMES) |
++	                             static_cast<uint32_t>(SPV_BINARY_TO_TEXT_OPTION_COMMENT) |
++	                             static_cast<uint32_t>(SPV_BINARY_TO_TEXT_OPTION_INDENT) |
++	                             static_cast<uint32_t>(SPV_BINARY_TO_TEXT_OPTION_COLOR));
++	LOGF("%s\n", text.c_str());
++	EXIT("ShaderRecompiler %s SPIR-V validation failed hash=0x%016" PRIx64 ":\n%s", stage,
++	     shader_hash, messages.c_str());
++}
++
++bool UseMeshCompute(const GraphicContext& graphics) {
++	const char* forced = std::getenv("KYTY_MESH_COMPUTE");
++	return !graphics.mesh_shader_enabled || (forced != nullptr && std::strcmp(forced, "1") == 0);
++}
++
+ ShaderRecompiler::Spirv::Profile SpirvProfile(const GraphicContext& graphics) {
+ 	// AMD GPUs (vendor 0x1002) run NMin/NMax as v_min/v_max, which give the guest's NaN and
+ 	// signed-zero results; GLSL.std.450 alone does not order -0 below +0.
+@@ -242,7 +250,8 @@ ShaderRecompiler::Spirv::Profile SpirvProfile(const GraphicContext& graphics) {
+ 	        .device_clock_period_ps = graphics.device_clock_period_ps,
+ 	        .robust_buffer_access   = graphics.robust_buffer_access_enabled,
+ 	        .r8_srgb_views          = graphics.r8_srgb_views,
+-	        .r8g8_srgb_views        = graphics.r8g8_srgb_views};
++	        .r8g8_srgb_views        = graphics.r8g8_srgb_views,
++	        .mesh_compute           = UseMeshCompute(graphics)};
+ }
+ 
+ std::filesystem::path ShaderStorePath() {
+@@ -468,6 +477,12 @@ PipelineCache::PipelineCache(GraphicContext&                         graphics,
+     : m_graphics(graphics), m_image_heap(image_heap),
+       m_next_driver_cache_save(std::chrono::steady_clock::now() + DriverCacheSaveInterval) {
+ 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
++	SetMeshCompute(UseMeshCompute(graphics));
++	if (MeshCompute()) {
++		Log::WriteToConsoleAndLog(fmt::format(
++		    "GPU: mesh shaders run as compute shaders ({}).\n",
++		    graphics.mesh_shader_enabled ? "KYTY_MESH_COMPUTE=1" : "no VK_EXT_mesh_shader"));
++	}
+ 	InitializeDriverCache();
+ 	WarmUp(shader_store);
+ }
+@@ -477,6 +492,7 @@ PipelineCache::~PipelineCache() {
+ 	auto destroy = [this](const auto& pipelines) {
+ 		for (const auto& pipeline: pipelines | std::views::values) {
+ 			m_graphics.device.destroyPipeline(pipeline.pipeline, nullptr);
++			m_graphics.device.destroyPipeline(pipeline.mesh_compute, nullptr);
+ 			m_graphics.device.destroyPipelineLayout(pipeline.pipeline_layout, nullptr);
+ 			m_graphics.device.destroyDescriptorSetLayout(pipeline.descriptor_set_layout, nullptr);
+ 		}
+@@ -709,19 +725,27 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
+ 		                         .buffer_format != Prospero::BufferFormat::k32UInt);
+ 	}
+ 	if (mesh_active) {
+-		EXIT_NOT_IMPLEMENTED(!m_graphics.mesh_shader_enabled);
++		const bool compute = MeshCompute();
++		EXIT_NOT_IMPLEMENTED(!m_graphics.mesh_shader_enabled && !compute);
+ 		auto& mesh              = vertex_info[0].mesh;
+ 		mesh.host_subgroup_size = m_graphics.subgroup_size;
+ 		const auto& limits      = m_graphics.mesh_shader_properties;
++		const auto& compute_limits = m_graphics.GetPhysicalDeviceProperties().limits;
+ 		const auto  logical_threads =
+ 		    mesh.threads_num[0] * mesh.threads_num[1] * mesh.threads_num[2];
+ 		const auto host_threads = ((logical_threads + mesh.wave_size - 1u) / mesh.wave_size) *
+ 		                          std::min(mesh.host_subgroup_size, mesh.wave_size);
+-		if (host_threads > limits.maxMeshWorkGroupInvocations ||
+-		    host_threads > limits.maxMeshWorkGroupSize[0] ||
+-		    mesh.max_vertices > limits.maxMeshOutputVertices ||
+-		    mesh.max_primitives > limits.maxMeshOutputPrimitives ||
+-		    mesh.lds_size_dwords * sizeof(uint32_t) > limits.maxMeshSharedMemorySize) {
++		// The workgroup keeps the LDS, the allocation pair and the Layer array either way.
++		const auto shared_bytes = mesh.lds_size_dwords * sizeof(uint32_t);
++		if (compute ? host_threads > compute_limits.maxComputeWorkGroupInvocations ||
++		                  host_threads > compute_limits.maxComputeWorkGroupSize[0] ||
++		                  shared_bytes + (2u + mesh.max_vertices) * sizeof(uint32_t) >
++		                      compute_limits.maxComputeSharedMemorySize
++		            : host_threads > limits.maxMeshWorkGroupInvocations ||
++		                  host_threads > limits.maxMeshWorkGroupSize[0] ||
++		                  mesh.max_vertices > limits.maxMeshOutputVertices ||
++		                  mesh.max_primitives > limits.maxMeshOutputPrimitives ||
++		                  shared_bytes > limits.maxMeshSharedMemorySize) {
+ 			static std::atomic_bool warned = false;
+ 			if (!warned.exchange(true, std::memory_order_relaxed)) {
+ 				Log::WriteToConsoleAndLog(fmt::format(
+@@ -733,7 +757,7 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
+ 		// A task shader launches each record's groups and passes its draw parameters in a
+ 		// payload beside the LDS, the allocation pair and the Layer array; without room for
+ 		// it, the CPU reads the records.
+-		if (state.indirect_draw &&
++		if (state.indirect_draw && !compute &&
+ 		    (mesh.lds_size_dwords + 2u + mesh.max_vertices +
+ 		     ShaderRecompiler::IR::PushData::MeshTaskPayloadDwordCount) * sizeof(uint32_t) <=
+ 		        limits.maxMeshPayloadAndSharedMemorySize) {
+@@ -852,6 +876,9 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
+ 	}
+ 	uint32_t push_data_cursor = ShaderRecompiler::IR::PushData::GraphicsDrawDwords(
+ 	    mesh_active, object_primitive_id, last_stage.user_clip_planes);
++	if (mesh_active && MeshCompute()) {
++		push_data_cursor += ShaderRecompiler::IR::PushData::MeshComputeOutputDwordCount;
++	}
+ 	if (pixel_active) {
+ 		const auto& pixel_module = *GetProgram(pixel_params, pixel_info, push_data_cursor);
+ 		for (const auto& output: pixel_module.info.info.outputs) {
+diff --git a/src/graphics/host_gpu/renderer/pipeline/pipelineCache.h b/src/graphics/host_gpu/renderer/pipeline/pipelineCache.h
+--- a/src/graphics/host_gpu/renderer/pipeline/pipelineCache.h
++++ b/src/graphics/host_gpu/renderer/pipeline/pipelineCache.h
+@@ -188,6 +188,8 @@ public:
+ 	struct Pipeline {
+ 		vk::PipelineLayout      pipeline_layout       = nullptr;
+ 		vk::Pipeline            pipeline              = nullptr;
++		// A mesh shader run as compute: the dispatch that writes what `pipeline` draws.
++		vk::Pipeline            mesh_compute          = nullptr;
+ 		vk::DescriptorSetLayout descriptor_set_layout = nullptr;
+ 		// The push constant range's stages, which every update names.
+ 		vk::ShaderStageFlags    push_stages;
+@@ -289,6 +291,11 @@ private:
+ std::filesystem::path ShaderStorePath();
+ // Host capabilities that change the emitted SPIR-V.
+ ShaderRecompiler::Spirv::Profile SpirvProfile(const GraphicContext& graphics);
++// With shader validation on, exits unless `spirv` is valid for Vulkan 1.3.
++void ValidateShaderSpirv(const char* stage, uint64_t shader_hash,
++                         const std::vector<uint32_t>& spirv, bool maintenance8_enabled);
++// Mesh shaders run as compute without VK_EXT_mesh_shader, or with KYTY_MESH_COMPUTE=1.
++bool UseMeshCompute(const GraphicContext& graphics);
+ 
+ // Stages are indexed like GraphicsPipelineKey::stage_ids.
+ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
+diff --git a/src/graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.cpp b/src/graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.cpp
+--- a/src/graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.cpp
++++ b/src/graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.cpp
+@@ -9,11 +9,26 @@
+ 
+ namespace Libs::Graphics {
+ 
++namespace {
++// Set by PipelineCache before any mesh shader is compiled.
++bool g_mesh_compute = false;
++} // namespace
++
++void SetMeshCompute(bool enabled) {
++	g_mesh_compute = enabled;
++}
++
++bool MeshCompute() {
++	return g_mesh_compute;
++}
++
+ vk::ShaderStageFlagBits NativeShaderStage(ShaderType stage) {
+ 	switch (stage) {
+ 		case ShaderType::Local:
+ 		case ShaderType::Vertex: return vk::ShaderStageFlagBits::eVertex;
+-		case ShaderType::Mesh: return vk::ShaderStageFlagBits::eMeshEXT;
++		case ShaderType::Mesh:
++			return g_mesh_compute ? vk::ShaderStageFlagBits::eCompute
++			                      : vk::ShaderStageFlagBits::eMeshEXT;
+ 		case ShaderType::TessellationControl: return vk::ShaderStageFlagBits::eTessellationControl;
+ 		case ShaderType::TessellationEvaluation:
+ 			return vk::ShaderStageFlagBits::eTessellationEvaluation;
+diff --git a/src/graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h b/src/graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h
+--- a/src/graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h
++++ b/src/graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h
+@@ -8,6 +8,11 @@ namespace Libs::Graphics {
+ 
+ struct ShaderStageRuntime;
+ 
++// Whether guest mesh shaders run as compute shaders that write their vertices and triangles to
++// a buffer, which a generated vertex shader then draws (Spirv::Profile::mesh_compute).
++void SetMeshCompute(bool enabled);
++bool MeshCompute();
++// The host stage of a guest stage; the compute stage for mesh shaders run as compute.
+ vk::ShaderStageFlagBits NativeShaderStage(ShaderType stage);
+ vk::PipelineStageFlags  ShaderPipelineStages(vk::ShaderStageFlags stages);
+ vk::MemoryBarrier       MakeShaderWriteDependency();
+diff --git a/src/graphics/host_gpu/renderer/pipeline/shaders.cpp b/src/graphics/host_gpu/renderer/pipeline/shaders.cpp
+--- a/src/graphics/host_gpu/renderer/pipeline/shaders.cpp
++++ b/src/graphics/host_gpu/renderer/pipeline/shaders.cpp
+@@ -11,6 +11,7 @@
+ #include "graphics/host_gpu/renderer/renderContext.h"
+ #include "graphics/host_gpu/renderer/renderTarget.h"
+ #include "graphics/host_gpu/vulkanCommon.h"
++#include "graphics/shader/meshComputeShader.h"
+ #include "graphics/shader/recompiler/ir/ShaderIR.h"
+ #include "graphics/shader/rectListShader.h"
+ #include "graphics/shader/shader.h"
+@@ -150,8 +151,17 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
+ 	const auto* pixel         = stages[3];
+ 	const bool  with_depth    = rendering.depth_format != vk::Format::eUndefined ||
+ 	                            rendering.stencil_format != vk::Format::eUndefined;
+-	const bool  mesh          = vertex.info.stage == ShaderType::Mesh;
++	const bool  mesh_compute  = vertex.info.stage == ShaderType::Mesh && MeshCompute();
++	// A mesh shader run as compute is drawn by a vertex shader, like a vertex program.
++	const bool  mesh          = vertex.info.stage == ShaderType::Mesh && !mesh_compute;
+ 	EXIT_NOT_IMPLEMENTED(mesh && !graphics.mesh_shader_enabled);
++	vk::ShaderModule mesh_vertex_module = nullptr;
++	if (mesh_compute) {
++		const auto spirv = BuildMeshComputeVertexShader(vertex.info);
++		ValidateShaderSpirv("mesh-vs", vertex.info.shader_hash, spirv,
++		                    graphics.maintenance8_enabled);
++		mesh_vertex_module = CompileSPV(spirv, graphics.device);
++	}
+ 	const bool rect_list = static_params.patch_control_points != 0 && stages[1] == nullptr;
+ 
+ 	vk::ShaderModule tess_control_shader_module = nullptr;
+@@ -170,7 +180,11 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
+ 	vk::PipelineShaderStageCreateInfo shader_stages[4] {};
+ 	uint32_t                          shader_stage_count = 0;
+ 	for (const auto* stage: stages) {
+-		if (stage != nullptr) {
++		if (stage == &vertex && mesh_compute) {
++			shader_stages[shader_stage_count++] = {.stage  = vk::ShaderStageFlagBits::eVertex,
++			                                       .module = mesh_vertex_module,
++			                                       .pName  = "main"};
++		} else if (stage != nullptr) {
+ 			shader_stages[shader_stage_count++] = {.stage  = NativeShaderStage(stage->info.stage),
+ 			                                       .module = stage->module,
+ 			                                       .pName  = "main"};
+@@ -219,6 +233,12 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
+ 	input_assembly.topology = static_params.topology;
+ 	input_assembly.primitiveRestartEnable =
+ 	    static_params.primitive_restart_enable ? VK_TRUE : VK_FALSE;
++	if (mesh_compute) {
++		// The vertex shader fetches by index; the compute pass wrote triangle lists.
++		vertex_input_info = vk::PipelineVertexInputStateCreateInfo {};
++		input_assembly.topology               = vk::PrimitiveTopology::eTriangleList;
++		input_assembly.primitiveRestartEnable = VK_FALSE;
++	}
+ 
+ 	vk::PipelineViewportDepthClipControlCreateInfoEXT depth_clip_control {};
+ 	depth_clip_control.negativeOneToOne = (static_params.negative_one_to_one ? VK_TRUE : VK_FALSE);
+@@ -288,6 +308,9 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
+ 	if (task_module) {
+ 		pipeline.push_stages |= vk::ShaderStageFlagBits::eTaskEXT;
+ 	}
++	if (mesh_compute) {
++		pipeline.push_stages |= vk::ShaderStageFlagBits::eVertex;
++	}
+ 	for (const auto* stage: stages) {
+ 		if (stage != nullptr) {
+ 			const auto native_stage = NativeShaderStage(stage->info.stage);
+@@ -356,6 +379,18 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
+ 	const auto result = graphics.device.createGraphicsPipelines(driver_cache, 1, &pipeline_info,
+ 	                                                            nullptr, &pipeline.pipeline);
+ 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
++	if (mesh_compute) {
++		// Shares the layout, so the draw's descriptors and push constants serve both.
++		vk::ComputePipelineCreateInfo compute {};
++		compute.stage  = {.stage  = vk::ShaderStageFlagBits::eCompute,
++		                  .module = vertex.module,
++		                  .pName  = "main"};
++		compute.layout = pipeline.pipeline_layout;
++		EXIT_NOT_IMPLEMENTED(graphics.device.createComputePipelines(
++		                         driver_cache, 1, &compute, nullptr, &pipeline.mesh_compute) !=
++		                     vk::Result::eSuccess);
++		graphics.device.destroyShaderModule(mesh_vertex_module, nullptr);
++	}
+ 
+ 	graphics.device.destroyShaderModule(tess_control_shader_module, nullptr);
+ 	graphics.device.destroyShaderModule(tess_eval_shader_module, nullptr);
+diff --git a/src/graphics/host_gpu/renderer/renderDraw.cpp b/src/graphics/host_gpu/renderer/renderDraw.cpp
+--- a/src/graphics/host_gpu/renderer/renderDraw.cpp
++++ b/src/graphics/host_gpu/renderer/renderDraw.cpp
+@@ -1047,6 +1047,11 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
+ 	const auto& mesh          = state.vertex_info[0].mesh;
+ 	const auto& limits        = m_context.GetGraphics().mesh_shader_properties;
+ 	uint32_t    mesh_groups   = 0;
++	// A mesh shader run as compute writes vertices and then triangle indices to the GPU-only
++	// utility buffer, which the pipeline's vertex shader draws from.
++	const bool  mesh_compute  = mesh_active && MeshCompute();
++	uint64_t    mesh_index_offset = 0;
++	uint32_t    mesh_index_count  = 0;
+ 	if (mesh_active) {
+ 		EXIT_NOT_IMPLEMENTED(mesh.fast_launch && (draw.indexed || primitive_restart_enable));
+ 		static std::atomic_bool restart_warned = false;
+@@ -1069,7 +1074,35 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
+ 			return;
+ 		}
+ 		mesh_groups = (primitives - 1u) / mesh.primitives_per_group + 1u;
+-		if (mesh_groups > limits.maxMeshWorkGroupCount[0] ||
++		if (mesh_compute) {
++			const auto& compute = m_context.GetGraphics().GetPhysicalDeviceProperties().limits;
++			if (mesh_groups > compute.maxComputeWorkGroupCount[0] ||
++			    draw.instance_count > compute.maxComputeWorkGroupCount[1]) {
++				EXIT("mesh draw exceeds host workgroup limits: %ux%u\n", mesh_groups,
++				     draw.instance_count);
++			}
++			uint64_t stride = 0;
++			for (const auto& output:
++			     state.vertex_info[0].stage.module->info.mesh_vertex_outputs) {
++				stride += ShaderRecompiler::IR::MeshComputeOutputDwords(output.kind);
++			}
++			const uint64_t groups = uint64_t {mesh_groups} * draw.instance_count;
++			const uint64_t vertex_bytes = groups * mesh.max_vertices * stride * sizeof(uint32_t);
++			const uint64_t index_count  = groups * mesh.max_primitives * 3u;
++			const auto&    storage =
++			    m_context.GetBufferCache().GetUtilityBuffer(MemoryUsage::DeviceLocal);
++			if (vertex_bytes + index_count * sizeof(uint32_t) > storage.Size()) {
++				static std::atomic_bool warned = false;
++				if (!warned.exchange(true, std::memory_order_relaxed)) {
++					Log::WriteToConsoleAndLog(fmt::format(
++					    "Warning: dropping mesh draws whose compute output exceeds {} bytes.\n",
++					    storage.Size()));
++				}
++				return;
++			}
++			mesh_index_offset = vertex_bytes;
++			mesh_index_count  = static_cast<uint32_t>(index_count);
++		} else if (mesh_groups > limits.maxMeshWorkGroupCount[0] ||
+ 		    draw.instance_count > limits.maxMeshWorkGroupCount[1] ||
+ 		    static_cast<uint64_t>(mesh_groups) * draw.instance_count >
+ 		        limits.maxMeshWorkGroupTotalCount) {
+@@ -1143,6 +1176,9 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
+ 		CommitVertexBuffers(vk_buffer, vertex_bindings);
+ 	}
+ 	CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages);
++	if (mesh_compute) {
++		CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline, stages);
++	}
+ 	if (!mesh_active) {
+ 		CommitIndexBuffer(vk_buffer, index_binding);
+ 	}
+@@ -1166,6 +1202,17 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
+ 		vk_buffer.pushConstants(pipeline.pipeline_layout, pipeline.push_stages, 0,
+ 		                        draw_dwords * sizeof(uint32_t), draw_data.data());
+ 	}
++	if (mesh_compute) {
++		const auto address = m_context.GetBufferCache()
++		                         .GetUtilityBuffer(MemoryUsage::DeviceLocal)
++		                         .BufferDeviceAddress();
++		const std::array<uint32_t, PushData::MeshComputeOutputDwordCount> words {
++		    static_cast<uint32_t>(address), static_cast<uint32_t>(address >> 32u)};
++		vk_buffer.pushConstants(
++		    pipeline.pipeline_layout, pipeline.push_stages,
++		    state.vertex_info[0].stage.module->info.mesh_output_dword * sizeof(uint32_t),
++		    sizeof(words), words.data());
++	}
+ 	if (const auto planes = vertex_stages.back().user_clip_planes; planes != 0) {
+ 		vk_buffer.pushConstants(pipeline.pipeline_layout, pipeline.push_stages,
+ 		                        PushData::UserClipPlaneDword * sizeof(uint32_t),
+@@ -1193,11 +1240,36 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
+ 		buffer.EndRendering();
+ 		ShaderWriteHazardBarrier(vk_buffer, shader_write_stages);
+ 	}
++	if (mesh_compute) {
++		buffer.EndRendering();
++		// Earlier draws may still read the utility buffer, and dispatches keep LDS there.
++		vk::MemoryBarrier reuse {};
++		reuse.srcAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite |
++		                      vk::AccessFlagBits::eIndexRead;
++		reuse.dstAccessMask = vk::AccessFlagBits::eShaderWrite;
++		vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
++		                          vk::PipelineStageFlagBits::eComputeShader, {}, 1, &reuse, 0,
++		                          nullptr, 0, nullptr);
++		vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.mesh_compute);
++		vk_buffer.dispatch(mesh_groups, draw.instance_count, 1);
++		vk::MemoryBarrier written {};
++		written.srcAccessMask = vk::AccessFlagBits::eShaderWrite;
++		written.dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eIndexRead;
++		vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
++		                          vk::PipelineStageFlagBits::eVertexInput |
++		                              vk::PipelineStageFlagBits::eVertexShader,
++		                          {}, 1, &written, 0, nullptr, 0, nullptr);
++	}
+ 	buffer.BeginRendering(rendering);
+ 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
+ 	auto&         occlusion_queries = m_context.GetOcclusionQueries();
+ 	const int32_t occlusion_query   = occlusion_queries.Begin(vk_buffer);
+-	if (mesh_task) {
++	if (mesh_compute) {
++		vk_buffer.bindIndexBuffer(
++		    m_context.GetBufferCache().GetUtilityBuffer(MemoryUsage::DeviceLocal).Handle(),
++		    mesh_index_offset, vk::IndexType::eUint32);
++		vk_buffer.drawIndexed(mesh_index_count, 1, 0, 0, 0);
++	} else if (mesh_task) {
+ 		vk_buffer.drawMeshTasksEXT(emit.indirect.count, 1, 1);
+ 	} else if (mesh_active) {
+ 		vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
+diff --git a/src/graphics/shader/meshComputeShader.cpp b/src/graphics/shader/meshComputeShader.cpp
+new file mode 100644
+--- /dev/null
++++ b/src/graphics/shader/meshComputeShader.cpp
+@@ -0,0 +1,251 @@
++#include "graphics/shader/meshComputeShader.h"
++
++#include "common/assert.h"
++#include "graphics/shader/recompiler/backend/spirv/SpirvBuilder.h"
++#include "graphics/shader/recompiler/ir/ShaderIR.h"
++
++#include <algorithm>
++#include <array>
++#include <cstdint>
++#include <span>
++#include <vector>
++
++namespace Libs::Graphics {
++
++namespace {
++
++using ShaderRecompiler::IR::StageOutputKind;
++using ShaderRecompiler::Spirv::Builder;
++
++constexpr uint32_t SpirvVersion15 = 0x00010500u;
++
++class MeshComputeVertexEmitter {
++public:
++	explicit MeshComputeVertexEmitter(const ShaderRecompiler::IR::CompiledShaderInfo& mesh_)
++	    : mesh(mesh_) {}
++
++	std::vector<uint32_t> Emit() {
++		for (const auto& output: mesh.mesh_vertex_outputs) {
++			if (output.kind == StageOutputKind::ClipDistance) {
++				clip_count = std::max(clip_count, output.index + 1u);
++			} else if (output.kind == StageOutputKind::CullDistance) {
++				cull_count = std::max(cull_count, output.index + 1u);
++			} else if (output.kind == StageOutputKind::Layer) {
++				layer = true;
++			} else {
++				EXIT_IF(output.kind != StageOutputKind::Position &&
++				        output.kind != StageOutputKind::Parameter);
++			}
++		}
++		DefineTypes();
++		DefineInterface();
++		builder.RequireCapability(spv::CapabilityShader);
++		builder.RequireCapability(spv::CapabilityInt64);
++		builder.RequireCapability(spv::CapabilityPhysicalStorageBufferAddresses);
++		if (clip_count != 0) builder.RequireCapability(spv::CapabilityClipDistance);
++		if (cull_count != 0) builder.RequireCapability(spv::CapabilityCullDistance);
++		if (layer) builder.RequireCapability(spv::CapabilityShaderLayer);
++		builder.AddMemoryModel(spv::AddressingModelPhysicalStorageBuffer64,
++		                       spv::MemoryModelGLSL450);
++
++		main = Result(spv::OpFunction, void_type, spv::FunctionControlMaskNone, function_type);
++		builder.AddEntryPoint(spv::ExecutionModelVertex, main, "main", interfaces);
++		ResultWithoutType(spv::OpLabel);
++
++		const auto dword   = mesh.mesh_output_dword;
++		const auto pair    = Result(spv::OpCompositeConstruct, uvec2_type, PushDword(dword),
++		                            PushDword(dword + 1u));
++		address            = Result(spv::OpBitcast, u64_type, pair);
++		const auto vertex  = Result(spv::OpBitcast, uint_type, Load(int_type, vertex_index));
++		uint32_t   stride  = 0;
++		for (const auto& output: mesh.mesh_vertex_outputs) {
++			stride += ShaderRecompiler::IR::MeshComputeOutputDwords(output.kind);
++		}
++		const auto base = Result(spv::OpIMul, uint_type, vertex, Uint(stride));
++
++		uint32_t offset = 0;
++		size_t   parameter = 0;
++		for (const auto& output: mesh.mesh_vertex_outputs) {
++			switch (output.kind) {
++				case StageOutputKind::Position:
++					Store(Access(ptr_output_vec4, per_vertex, Uint(0)), LoadVec4(base, offset));
++					break;
++				case StageOutputKind::Parameter:
++					Store(parameters[parameter++], LoadVec4(base, offset));
++					break;
++				case StageOutputKind::ClipDistance:
++				case StageOutputKind::CullDistance: {
++					const auto member = output.kind == StageOutputKind::ClipDistance
++					                        ? clip_member : cull_member;
++					Store(Access(ptr_output_float, per_vertex, Uint(member), Uint(output.index)),
++					      Result(spv::OpBitcast, float_type, LoadDword(base, offset)));
++					break;
++				}
++				case StageOutputKind::Layer:
++					Store(layer_variable, LoadDword(base, offset));
++					break;
++				default: break;
++			}
++			offset += ShaderRecompiler::IR::MeshComputeOutputDwords(output.kind);
++		}
++
++		builder.AddFunction(spv::OpReturn);
++		builder.AddFunction(spv::OpFunctionEnd);
++		return builder.Build();
++	}
++
++private:
++	void DefineTypes() {
++		void_type     = builder.Type(spv::OpTypeVoid);
++		uint_type     = builder.Type(spv::OpTypeInt, 32u, 0u);
++		int_type      = builder.Type(spv::OpTypeInt, 32u, 1u);
++		u64_type      = builder.Type(spv::OpTypeInt, 64u, 0u);
++		float_type    = builder.Type(spv::OpTypeFloat, 32u);
++		uvec2_type    = builder.Type(spv::OpTypeVector, uint_type, 2u);
++		vec4_type     = builder.Type(spv::OpTypeVector, float_type, 4u);
++		function_type = builder.Type(spv::OpTypeFunction, void_type);
++		ptr_physical_uint = builder.Type(spv::OpTypePointer,
++		                                 spv::StorageClassPhysicalStorageBuffer, uint_type);
++		ptr_output_vec4  = Pointer(spv::StorageClassOutput, vec4_type);
++		ptr_output_float = Pointer(spv::StorageClassOutput, float_type);
++		ptr_push_uint    = Pointer(spv::StorageClassPushConstant, uint_type);
++	}
++
++	void DefineInterface() {
++		vertex_index = AddInterface(spv::StorageClassInput, int_type);
++		Decorate(vertex_index, spv::DecorationBuiltIn, spv::BuiltInVertexIndex);
++
++		const auto dwords = builder.DecoratedType(
++		    spv::OpTypeArray, {{spv::OpDecorate, {spv::DecorationArrayStride, 4u}}}, uint_type,
++		    Uint(ShaderRecompiler::IR::PushData::DwordCount));
++		const auto push_type = builder.DecoratedType(
++		    spv::OpTypeStruct,
++		    {{spv::OpMemberDecorate, {0u, spv::DecorationOffset, 0u}},
++		     {spv::OpDecorate, {spv::DecorationBlock}}},
++		    dwords);
++		push_data = AddInterface(spv::StorageClassPushConstant, push_type);
++
++		// gl_PerVertex: Position, then the clip and cull distance arrays present.
++		std::vector<uint32_t> members {vec4_type};
++		if (clip_count != 0) {
++			clip_member = static_cast<uint32_t>(members.size());
++			members.push_back(builder.Type(spv::OpTypeArray, float_type, Uint(clip_count)));
++		}
++		if (cull_count != 0) {
++			cull_member = static_cast<uint32_t>(members.size());
++			members.push_back(builder.Type(spv::OpTypeArray, float_type, Uint(cull_count)));
++		}
++		const auto per_vertex_type =
++		    builder.Type(spv::OpTypeStruct, std::span<const uint32_t>(members));
++		builder.AddAnnotation(spv::OpMemberDecorate, per_vertex_type, 0u, spv::DecorationBuiltIn,
++		                      spv::BuiltInPosition);
++		if (clip_count != 0) {
++			builder.AddAnnotation(spv::OpMemberDecorate, per_vertex_type, clip_member,
++			                      spv::DecorationBuiltIn, spv::BuiltInClipDistance);
++		}
++		if (cull_count != 0) {
++			builder.AddAnnotation(spv::OpMemberDecorate, per_vertex_type, cull_member,
++			                      spv::DecorationBuiltIn, spv::BuiltInCullDistance);
++		}
++		builder.AddAnnotation(spv::OpDecorate, per_vertex_type, spv::DecorationBlock);
++		per_vertex = AddInterface(spv::StorageClassOutput, per_vertex_type);
++
++		for (const auto& output: mesh.mesh_vertex_outputs) {
++			if (output.kind == StageOutputKind::Parameter) {
++				const auto variable = AddInterface(spv::StorageClassOutput, vec4_type);
++				Decorate(variable, spv::DecorationLocation, output.location);
++				parameters.push_back(variable);
++			}
++		}
++		if (layer) {
++			layer_variable = AddInterface(spv::StorageClassOutput, uint_type);
++			Decorate(layer_variable, spv::DecorationBuiltIn, spv::BuiltInLayer);
++		}
++	}
++
++	uint32_t PushDword(uint32_t index) {
++		return Load(uint_type, Access(ptr_push_uint, push_data, Uint(0), Uint(index)));
++	}
++
++	// Dword base + offset of the output buffer.
++	uint32_t LoadDword(uint32_t base, uint32_t offset) {
++		const auto dword  = Result(spv::OpIAdd, uint_type, base, Uint(offset));
++		const auto bytes  = Result(spv::OpShiftLeftLogical, u64_type,
++		                           Result(spv::OpUConvert, u64_type, dword),
++		                           builder.Constant(spv::OpConstant, u64_type, 2u, 0u));
++		const auto pointer = Result(spv::OpConvertUToPtr, ptr_physical_uint,
++		                            Result(spv::OpIAdd, u64_type, address, bytes));
++		const auto value = builder.AllocateId();
++		builder.AddFunction(spv::OpLoad, uint_type, value, pointer, spv::MemoryAccessAlignedMask,
++		                    static_cast<uint32_t>(sizeof(uint32_t)));
++		return value;
++	}
++
++	uint32_t LoadVec4(uint32_t base, uint32_t offset) {
++		std::array<uint32_t, 4> components {};
++		for (uint32_t i = 0; i < 4; i++) {
++			components[i] = Result(spv::OpBitcast, float_type, LoadDword(base, offset + i));
++		}
++		return Result(spv::OpCompositeConstruct, vec4_type, components[0], components[1],
++		              components[2], components[3]);
++	}
++
++	uint32_t Pointer(spv::StorageClass storage, uint32_t type) {
++		return builder.Type(spv::OpTypePointer, storage, type);
++	}
++
++	template <typename... Args>
++	uint32_t Result(spv::Op opcode, uint32_t type, Args... operands) {
++		const auto id = builder.AllocateId();
++		builder.AddFunction(opcode, type, id, operands...);
++		return id;
++	}
++
++	template <typename... Args>
++	uint32_t ResultWithoutType(spv::Op opcode, Args... operands) {
++		const auto id = builder.AllocateId();
++		builder.AddFunction(opcode, id, operands...);
++		return id;
++	}
++
++	template <typename... Args>
++	uint32_t Access(uint32_t pointer_type, uint32_t base, Args... indices) {
++		return Result(spv::OpAccessChain, pointer_type, base, indices...);
++	}
++
++	uint32_t Load(uint32_t type, uint32_t pointer) { return Result(spv::OpLoad, type, pointer); }
++
++	void Store(uint32_t pointer, uint32_t value) { builder.AddFunction(spv::OpStore, pointer, value); }
++
++	uint32_t Uint(uint32_t value) { return builder.Constant(spv::OpConstant, uint_type, value); }
++
++	uint32_t AddInterface(spv::StorageClass storage, uint32_t type) {
++		const auto variable = builder.DefineGlobalVariable(Pointer(storage, type), storage);
++		interfaces.push_back(variable);
++		return variable;
++	}
++
++	void Decorate(uint32_t target, spv::Decoration decoration, uint32_t value) {
++		builder.AddAnnotation(spv::OpDecorate, target, decoration, value);
++	}
++
++	const ShaderRecompiler::IR::CompiledShaderInfo& mesh;
++	Builder                                         builder {SpirvVersion15};
++	std::vector<uint32_t>                           interfaces;
++	std::vector<uint32_t>                           parameters;
++	uint32_t clip_count = 0, cull_count = 0, clip_member = 0, cull_member = 0;
++	bool     layer = false;
++	uint32_t main = 0, void_type = 0, uint_type = 0, int_type = 0, u64_type = 0, float_type = 0;
++	uint32_t uvec2_type = 0, vec4_type = 0, function_type = 0, ptr_physical_uint = 0;
++	uint32_t ptr_output_vec4 = 0, ptr_output_float = 0, ptr_push_uint = 0;
++	uint32_t vertex_index = 0, push_data = 0, per_vertex = 0, layer_variable = 0, address = 0;
++};
++
++} // namespace
++
++std::vector<uint32_t> BuildMeshComputeVertexShader(
++    const ShaderRecompiler::IR::CompiledShaderInfo& mesh) {
++	return MeshComputeVertexEmitter(mesh).Emit();
++}
++
++} // namespace Libs::Graphics
+diff --git a/src/graphics/shader/meshComputeShader.h b/src/graphics/shader/meshComputeShader.h
+new file mode 100644
+--- /dev/null
++++ b/src/graphics/shader/meshComputeShader.h
+@@ -0,0 +1,21 @@
++#ifndef EMULATOR_SRC_GRAPHICS_SHADER_MESHCOMPUTESHADER_H_
++#define EMULATOR_SRC_GRAPHICS_SHADER_MESHCOMPUTESHADER_H_
++
++#include <cstdint>
++#include <vector>
++
++namespace Libs::Graphics {
++
++namespace ShaderRecompiler::IR {
++struct CompiledShaderInfo;
++} // namespace ShaderRecompiler::IR
++
++// The vertex shader that draws what a mesh shader run as compute wrote: vertex gl_VertexIndex's
++// outputs, in mesh_vertex_outputs order, from the buffer whose device address is in push dwords
++// mesh_output_dword and mesh_output_dword + 1.
++std::vector<uint32_t> BuildMeshComputeVertexShader(
++    const ShaderRecompiler::IR::CompiledShaderInfo& mesh);
++
++} // namespace Libs::Graphics
++
++#endif // EMULATOR_SRC_GRAPHICS_SHADER_MESHCOMPUTESHADER_H_
+diff --git a/src/graphics/shader/recompiler/backend/spirv/SpirvEmitter.cpp b/src/graphics/shader/recompiler/backend/spirv/SpirvEmitter.cpp
+--- a/src/graphics/shader/recompiler/backend/spirv/SpirvEmitter.cpp
++++ b/src/graphics/shader/recompiler/backend/spirv/SpirvEmitter.cpp
+@@ -45,8 +45,14 @@ std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo inp
+ 	        : 1u;
+ 	DefineModule(state);
+ 	EmitProgram(state);
+-	state.builder.AddEntryPoint(ExecutionModelForStage(state.program.stage), state.main_func,
+-	                            "main", state.interface_variables);
++	state.builder.AddEntryPoint(MeshCompute(state) ? spv::ExecutionModelGLCompute
++	                                               : ExecutionModelForStage(state.program.stage),
++	                            state.main_func, "main", state.interface_variables);
++	if (MeshCompute(state)) {
++		program.mesh_vertex_outputs.assign(state.outputs.begin(), state.outputs.end());
++		program.mesh_output_dword =
++		    IR::PushData::GraphicsDrawDwords(true, false, state.input_info.vertex->user_clip_planes);
++	}
+ 
+ 	return state.builder.Build();
+ }
+diff --git a/src/graphics/shader/recompiler/backend/spirv/SpirvEmitter.h b/src/graphics/shader/recompiler/backend/spirv/SpirvEmitter.h
+--- a/src/graphics/shader/recompiler/backend/spirv/SpirvEmitter.h
++++ b/src/graphics/shader/recompiler/backend/spirv/SpirvEmitter.h
+@@ -20,6 +20,9 @@ struct Profile {
+ 	// 8 and 8_8 sRGB textures sample through sRGB views; without one the shader decodes them.
+ 	bool r8_srgb_views   = false;
+ 	bool r8g8_srgb_views = false;
++	// Mesh shaders become compute shaders that write their vertices and triangles to a buffer,
++	// for hosts without VK_EXT_mesh_shader.
++	bool mesh_compute = false;
+ };
+ 
+ inline constexpr Profile DefaultProfile {};
+diff --git a/src/graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h b/src/graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h
+--- a/src/graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h
++++ b/src/graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h
+@@ -350,6 +350,11 @@ void EmitStorageImageWrite(EmitterState& state, uint32_t resource, uint32_t mip_
+ 
+ spv::ExecutionModel ExecutionModelForStage(ShaderType stage);
+ 
++// A mesh shader emitted as a compute shader that writes its outputs to a buffer.
++inline bool MeshCompute(const EmitterState& state) {
++	return state.program.stage == ShaderType::Mesh && state.profile.mesh_compute;
++}
++
+ uint32_t ConstantI32(EmitterState& state, int32_t value);
+ 
+ uint32_t ConstantF32(EmitterState& state, uint32_t bits);
+diff --git a/src/graphics/shader/recompiler/backend/spirv/spirvEmitterMesh.cpp b/src/graphics/shader/recompiler/backend/spirv/spirvEmitterMesh.cpp
+--- a/src/graphics/shader/recompiler/backend/spirv/spirvEmitterMesh.cpp
++++ b/src/graphics/shader/recompiler/backend/spirv/spirvEmitterMesh.cpp
+@@ -1,5 +1,7 @@
+ #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
+ 
++#include <array>
++
+ namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
+ namespace {
+ 
+@@ -35,6 +37,142 @@ uint32_t MeshOutputType(EmitterState& state, IR::StageOutputKind kind) {
+ 	}
+ }
+ 
++// Stores `value` at dword `dword` of the buffer at device address `address`.
++void StoreAddressDword(EmitterState& state, uint32_t address, uint32_t dword, uint32_t value) {
++	const auto offset =
++	    Binary(state, spv::OpShiftLeftLogical, TypeU64(state),
++	           Unary(state, spv::OpUConvert, TypeU64(state), dword), ConstantU64(state, 2));
++	const auto pointer =
++	    Unary(state, spv::OpConvertUToPtr, TypePhysicalU32Pointer(state),
++	          Binary(state, spv::OpIAdd, TypeU64(state), address, offset));
++	state.builder.AddFunction(spv::OpStore, pointer, value, spv::MemoryAccessAlignedMask,
++	                          static_cast<uint32_t>(sizeof(uint32_t)));
++}
++
++uint32_t ToU32(EmitterState& state, uint32_t value, uint32_t type) {
++	return type == TypeU32(state) ? value : Unary(state, spv::OpBitcast, TypeU32(state), value);
++}
++
++// The compute form of EmitMeshEntryPoint. Group g of the dispatch (x + y * width) owns vertices
++// g * max_vertices onward of the output buffer, then its max_primitives triangles follow every
++// group's vertices as 32-bit indices. Unused and culled triangles repeat the group's first
++// vertex, so they cover no pixels. Layer goes with each vertex instead of each primitive.
++void EmitMeshComputeEntryPoint(EmitterState& state) {
++	const auto& mesh = state.input_info.vertex->mesh;
++	state.builder.AddFunction(spv::OpFunction, TypeVoid(state), state.main_func,
++	                          spv::FunctionControlMaskNone, TypeFunction(state));
++	EmitLabel(state, state.builder.AllocateId());
++	state.builder.AddFunction(spv::OpFunctionCall, TypeVoid(state), state.builder.AllocateId(),
++	                          state.mesh_guest_func);
++	EmitBarrier(state);
++	const auto vertices   = MeshLoad(state, state.mesh_allocation, spv::StorageClassWorkgroup,
++	                                 TypeU32(state), ConstantU32(state, 0));
++	const auto primitives = MeshLoad(state, state.mesh_allocation, spv::StorageClassWorkgroup,
++	                                 TypeU32(state), ConstantU32(state, 1));
++
++	uint32_t stride = 0;
++	for (const auto& output: state.outputs) {
++		stride += IR::MeshComputeOutputDwords(output.kind);
++	}
++	const auto dword = IR::PushData::GraphicsDrawDwords(true, false, state.input_info.vertex->user_clip_planes);
++	const auto address =
++	    PackU64(state, EmitPushDataLoad(state, ConstantU32(state, dword)),
++	            EmitPushDataLoad(state, ConstantU32(state, dword + 1u)));
++	const auto group_x = EmitInputComponentU32(state, IR::StageInputKind::WorkgroupId, 0);
++	const auto group_y = EmitInputComponentU32(state, IR::StageInputKind::WorkgroupId, 1);
++	const auto width   = EmitInputComponentU32(state, IR::StageInputKind::NumWorkgroups, 0);
++	const auto height  = EmitInputComponentU32(state, IR::StageInputKind::NumWorkgroups, 1);
++	const auto group   = EmitAddU32(state, group_x, EmitBinaryU32(state, spv::OpIMul, group_y, width));
++	const auto groups  = EmitBinaryU32(state, spv::OpIMul, width, height);
++	const auto first_vertex =
++	    EmitBinaryU32(state, spv::OpIMul, group, ConstantU32(state, mesh.max_vertices));
++	const auto vertex_dwords =
++	    EmitBinaryU32(state, spv::OpIMul, first_vertex, ConstantU32(state, stride));
++	const auto index_dwords = EmitAddU32(
++	    state, EmitBinaryU32(state, spv::OpIMul, groups,
++	                         ConstantU32(state, mesh.max_vertices * stride)),
++	    EmitBinaryU32(state, spv::OpIMul, group, ConstantU32(state, mesh.max_primitives * 3u)));
++
++	// Invocation indices cover this many triangle slots per pass (EmitLocalInvocationIndex).
++	uint32_t logical = 1;
++	for (const auto count: mesh.threads_num) {
++		logical *= count != 0 ? count : 1u;
++	}
++	const auto coverage = state.lane_count == 2 ? (logical + 63u) / 64u * 64u : logical;
++
++	for (uint32_t half = 0; half < state.lane_count; half++) {
++		state.lane_half      = half;
++		const auto index     = EmitLocalInvocationIndex(state);
++		const auto is_vertex = Binary(state, spv::OpULessThan, TypeBool(state), index, vertices);
++		EmitIfCondition(state, is_vertex, [&] {
++			const auto base = EmitAddU32(
++			    state, vertex_dwords, EmitBinaryU32(state, spv::OpIMul, index, ConstantU32(state, stride)));
++			uint32_t offset = 0;
++			for (const auto& output: state.outputs) {
++				const auto type   = MeshOutputType(state, output.kind);
++				const bool layer  = output.kind == IR::StageOutputKind::Layer;
++				const auto value  = layer ? MeshLoad(state, output.mesh_data_variable,
++				                                     spv::StorageClassWorkgroup, type, index)
++				                          : MeshLoad(state, output.mesh_data_variable,
++				                                     spv::StorageClassPrivate, type,
++				                                     ConstantU32(state, half));
++				const auto count  = IR::MeshComputeOutputDwords(output.kind);
++				for (uint32_t component = 0; component < count; component++) {
++					auto element = value;
++					if (count > 1u) {
++						element = state.builder.AllocateId();
++						state.builder.AddFunction(spv::OpCompositeExtract, TypeF32(state), element,
++						                          value, component);
++					}
++					StoreAddressDword(state, address,
++					                  EmitAddU32(state, base, ConstantU32(state, offset + component)),
++					                  ToU32(state, element, count > 1u ? TypeF32(state) : type));
++				}
++				offset += count;
++			}
++		});
++		for (uint32_t pass = 0; pass * coverage < mesh.max_primitives; pass++) {
++			const auto slot =
++			    pass == 0 ? index : EmitAddU32(state, index, ConstantU32(state, pass * coverage));
++			const auto in_range = Binary(state, spv::OpULessThan, TypeBool(state), slot,
++			                             ConstantU32(state, mesh.max_primitives));
++			EmitIfCondition(state, in_range, [&] {
++				std::array<uint32_t, 3> triangle {first_vertex, first_vertex, first_vertex};
++				if (pass == 0) {
++					const auto packed = MeshLoad(state, state.mesh_primitive_data,
++					                             spv::StorageClassPrivate, TypeU32(state),
++					                             ConstantU32(state, half));
++					const auto culled_bit = EmitBinaryU32(state, spv::OpBitwiseAnd, packed,
++					                                      ConstantU32(state, 0x80000000u));
++					const auto live = Binary(
++					    state, spv::OpLogicalAnd, TypeBool(state),
++					    Binary(state, spv::OpULessThan, TypeBool(state), index, primitives),
++					    Binary(state, spv::OpIEqual, TypeBool(state), culled_bit, ConstantU32(state, 0)));
++					for (uint32_t component = 0; component < 3; component++) {
++						const auto vertex = state.builder.AllocateId();
++						state.builder.AddFunction(spv::OpBitFieldUExtract, TypeU32(state), vertex,
++						                          packed, ConstantU32(state, component * 10u),
++						                          ConstantU32(state, 9));
++						triangle[component] = Select(state, TypeU32(state), live,
++						                             EmitAddU32(state, first_vertex, vertex),
++						                             first_vertex);
++					}
++				}
++				const auto base = EmitAddU32(
++				    state, index_dwords, EmitBinaryU32(state, spv::OpIMul, slot, ConstantU32(state, 3)));
++				for (uint32_t component = 0; component < 3; component++) {
++					StoreAddressDword(state, address,
++					                  EmitAddU32(state, base, ConstantU32(state, component)),
++					                  triangle[component]);
++				}
++			});
++		}
++	}
++	state.lane_half = 0;
++	state.builder.AddFunction(spv::OpReturn);
++	state.builder.AddFunction(spv::OpFunctionEnd);
++}
++
+ } // namespace
+ 
+ void DefineMeshOutputs(EmitterState& state, uint32_t clip_distance_count,
+@@ -46,7 +184,7 @@ void DefineMeshOutputs(EmitterState& state, uint32_t clip_distance_count,
+ 		const bool cull = output.kind == IR::StageOutputKind::CullDistance;
+ 		auto& variable = clip ? state.clip_distance_variable
+ 		                 : cull ? state.cull_distance_variable : output.variable_id;
+-		if (variable == 0) {
++		if (variable == 0 && !MeshCompute(state)) {
+ 			const auto element_type = clip || cull
+ 			                              ? state.builder.Type(spv::OpTypeArray, type,
+ 			                                                   ConstantU32(state, clip ? clip_distance_count
+@@ -81,6 +219,9 @@ void DefineMeshOutputs(EmitterState& state, uint32_t clip_distance_count,
+ 	state.mesh_allocation = MeshArray(state, spv::StorageClassWorkgroup, TypeU32(state), 2);
+ 	state.mesh_primitive_data =
+ 	    MeshArray(state, spv::StorageClassPrivate, TypeU32(state), state.lane_count);
++	if (MeshCompute(state)) {
++		return;
++	}
+ 	state.mesh_primitives =
+ 	    MeshArray(state, spv::StorageClassOutput, TypeU32Vector(state, 3), mesh.max_primitives);
+ 	state.mesh_cull =
+@@ -136,6 +277,10 @@ void EmitMeshAllocate(ValueEmitContext& ctx, const IR::Inst& inst) {
+ }
+ 
+ void EmitMeshEntryPoint(EmitterState& state) {
++	if (MeshCompute(state)) {
++		EmitMeshComputeEntryPoint(state);
++		return;
++	}
+ 	state.builder.AddFunction(spv::OpFunction, TypeVoid(state), state.main_func,
+ 	                          spv::FunctionControlMaskNone, TypeFunction(state));
+ 	EmitLabel(state, state.builder.AllocateId());
+diff --git a/src/graphics/shader/recompiler/backend/spirv/spirvEmitterModule.cpp b/src/graphics/shader/recompiler/backend/spirv/spirvEmitterModule.cpp
+--- a/src/graphics/shader/recompiler/backend/spirv/spirvEmitterModule.cpp
++++ b/src/graphics/shader/recompiler/backend/spirv/spirvEmitterModule.cpp
+@@ -480,6 +480,12 @@ void DefineInputs(EmitterState& state) {
+ 		add_builtin(IR::StageInputKind::WorkgroupId, 3, "gl_WorkGroupID");
+ 		add_builtin(IR::StageInputKind::NumWorkgroups, 3, "gl_NumWorkGroups");
+ 	}
++	if (MeshCompute(state)) {
++		// The compute entry point places each group's outputs by its flattened group index.
++		add_builtin(IR::StageInputKind::LocalInvocationIndex, 1, "gl_LocalInvocationIndex");
++		add_builtin(IR::StageInputKind::WorkgroupId, 3, "gl_WorkGroupID");
++		add_builtin(IR::StageInputKind::NumWorkgroups, 3, "gl_NumWorkGroups");
++	}
+ 	if (state.lane_count == 2) {
+ 		add_builtin(IR::StageInputKind::LocalInvocationIndex, 1, "gl_LocalInvocationIndex");
+ 		if (std::ranges::any_of(state.inputs, [](const InputBinding& input) {
+@@ -729,7 +735,11 @@ void DefineModule(EmitterState& state) {
+ 		}
+ 	}
+ 	state.main_func = state.builder.AllocateId();
+-	if (state.program.stage == ShaderType::Mesh) {
++	if (MeshCompute(state)) {
++		state.mesh_guest_func = state.builder.AllocateId();
++		// Indirect draws read their records on the CPU; there is no task shader.
++		EXIT_IF(state.input_info.vertex->indirect_draw);
++	} else if (state.program.stage == ShaderType::Mesh) {
+ 		state.mesh_guest_func = state.builder.AllocateId();
+ 		state.builder.RequireCapability(spv::CapabilityMeshShadingEXT); // MeshShadingEXT
+ 		state.builder.RequireExtension("SPV_EXT_mesh_shader");
+@@ -762,7 +772,7 @@ void DefineModule(EmitterState& state) {
+ 	if (state.program.info.buffer_u16) {
+ 		state.builder.RequireCapability(spv::CapabilityStorageBuffer16BitAccess);
+ 	}
+-	if (state.program.info.uses_dma || state.program.info.uses_image_heap) {
++	if (state.program.info.uses_dma || state.program.info.uses_image_heap || MeshCompute(state)) {
+ 		state.builder.RequireCapability(spv::CapabilityInt64);
+ 		state.builder.RequireCapability(spv::CapabilityPhysicalStorageBufferAddresses);
+ 		state.builder.RequireExtension("SPV_KHR_physical_storage_buffer");
+@@ -834,7 +844,8 @@ void DefineModule(EmitterState& state) {
+ 		state.builder.RequireExtension("SPV_KHR_fragment_shader_barycentric");
+ 	}
+ 	state.builder.RequireExtension("SPV_KHR_float_controls");
+-	state.builder.AddMemoryModel(state.program.info.uses_dma || state.program.info.uses_image_heap
++	state.builder.AddMemoryModel(state.program.info.uses_dma || state.program.info.uses_image_heap ||
++	                                     MeshCompute(state)
+ 	                                 ? spv::AddressingModelPhysicalStorageBuffer64
+ 	                                 : spv::AddressingModelLogical,
+ 	                             spv::MemoryModelGLSL450);
+diff --git a/src/graphics/shader/recompiler/ir/Program.cpp b/src/graphics/shader/recompiler/ir/Program.cpp
+--- a/src/graphics/shader/recompiler/ir/Program.cpp
++++ b/src/graphics/shader/recompiler/ir/Program.cpp
+@@ -146,8 +146,10 @@ CompiledShaderInfo Program::TakeCompiledInfo() && {
+ 	    .wave_size          = wave_size,
+ 	    .user_data_base     = user_data_base,
+ 	    .has_address_writes = has_address_writes,
+-	    .info               = std::move(info),
+-	    .bindings           = std::move(bindings),
++	    .info                = std::move(info),
++	    .bindings            = std::move(bindings),
++	    .mesh_vertex_outputs = std::move(mesh_vertex_outputs),
++	    .mesh_output_dword   = mesh_output_dword,
+ 	};
+ 	for (const auto& output: result.info.outputs) {
+ 		if (output.kind == StageOutputKind::Parameter && output.index < 32) {
+diff --git a/src/graphics/shader/recompiler/ir/Serialize.h b/src/graphics/shader/recompiler/ir/Serialize.h
+--- a/src/graphics/shader/recompiler/ir/Serialize.h
++++ b/src/graphics/shader/recompiler/ir/Serialize.h
+@@ -174,8 +174,8 @@ KYTY_IO_FIELDS(ResourceSpecialization::Image, a, b, c, d, e, f, g, h, i, j, k, l
+ KYTY_IO_FIELDS(ResourceSpecialization::Sampler, a, b, c)
+ KYTY_IO_FIELDS(ResourceSpecialization, a, b, c)
+ KYTY_IO_FIELDS(Bindings, a, b, c, d, e)
+-KYTY_IO_FIELDS(CompiledShaderInfo, a, b, c, d, e, f, g, h)
+-KYTY_IO_FIELDS(Spirv::Profile, a, b, c, d, e, f)
++KYTY_IO_FIELDS(CompiledShaderInfo, a, b, c, d, e, f, g, h, i, j)
++KYTY_IO_FIELDS(Spirv::Profile, a, b, c, d, e, f, g)
+ KYTY_IO_FIELDS(ShaderTessellationInputInfo, a, b, c, d, e, f, g, h, i)
+ KYTY_IO_FIELDS(RectListParameter, a, b, c)
+ #undef KYTY_IO_FIELDS
+diff --git a/src/graphics/shader/recompiler/ir/ShaderIR.h b/src/graphics/shader/recompiler/ir/ShaderIR.h
+--- a/src/graphics/shader/recompiler/ir/ShaderIR.h
++++ b/src/graphics/shader/recompiler/ir/ShaderIR.h
+@@ -337,6 +337,12 @@ struct StageOutput {
+ 	bool operator==(const StageOutput& other) const = default;
+ };
+ 
++// Dwords that one output of a vertex takes in the vertex buffer a mesh shader run as compute
++// writes (Spirv::Profile::mesh_compute).
++[[nodiscard]] constexpr uint32_t MeshComputeOutputDwords(StageOutputKind kind) {
++	return kind == StageOutputKind::Position || kind == StageOutputKind::Parameter ? 4u : 1u;
++}
++
+ inline constexpr uint32_t FirstImageBinding           = 1u;
+ inline constexpr uint32_t FirstComparisonImageBinding = 22u;
+ inline constexpr uint32_t FirstStorageImageBinding    = 29u;
+@@ -373,6 +379,8 @@ struct PushData {
+ 
+ 	// User clip planes 0..N follow the mesh draw parameters or object ID, four dwords each.
+ 	static constexpr uint32_t UserClipPlaneDword = MeshDrawDwordCount;
++	// A mesh shader run as compute: the device address of its output buffer, after the planes.
++	static constexpr uint32_t MeshComputeOutputDwordCount = 2;
+ 
+ 	[[nodiscard]] static constexpr uint32_t GraphicsDrawDwords(bool mesh, bool object_id,
+ 	                                                           uint32_t user_clip_planes = 0) {
+@@ -670,6 +678,10 @@ struct CompiledShaderInfo {
+ 	bool       has_address_writes = false;
+ 	ShaderInfo info;
+ 	Bindings   bindings;
++	// A mesh shader run as compute: each vertex's outputs in buffer order, and the push dword
++	// that holds the buffer's address.
++	std::vector<StageOutput> mesh_vertex_outputs;
++	uint32_t                 mesh_output_dword = 0;
+ };
+ 
+ struct UniformFillPlan {
+@@ -745,6 +757,9 @@ struct Program: ResourcePlan {
+ 	bool                          has_address_writes = false;
+ 	bool                          shader_info_complete = false;
+ 	Bindings                      bindings;
++	// Set by the SPIR-V emitter for a mesh shader run as compute (CompiledShaderInfo).
++	std::vector<StageOutput>      mesh_vertex_outputs;
++	uint32_t                      mesh_output_dword = 0;
+ 
+ };
+ 
+diff --git a/tests/ShaderRecompilerComputeTests.cpp b/tests/ShaderRecompilerComputeTests.cpp
+--- a/tests/ShaderRecompilerComputeTests.cpp
++++ b/tests/ShaderRecompilerComputeTests.cpp
+@@ -35,6 +35,7 @@
+ #include "graphics/host_gpu/renderer/image/tiler.h"
+ #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
+ #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
++#include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
+ #include "graphics/host_gpu/renderer/debug.h"
+ #include "graphics/host_gpu/renderer/render.h"
+ #include "graphics/host_gpu/renderer/renderContext.h"
+@@ -20952,15 +20953,36 @@ public:
+             {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, {});
+         read_covered("direct draw", RenderExecutorTestAccess::DrawAuto(
+             executor, scheduler.Current(), {.vertex_count = 3, .instance_count = 1}));
+-        check("unpatched bases", true, 3, 1, {});
+-        // The patched SGPRs replace user data 0/0 with the records' bases.
+-        shaders.SetGsUserSgpr(0, 0);
+-        shaders.SetGsUserSgpr(1, 0);
+-        check("indexed subgroups", true, 0, 2, {0, 1});
+-        check("first index and instances", true, 2, 1, {0, 1});
+-        check("auto subgroups", false, 4, 2, {0, 1});
+-        // Index reads stop at INDEX_BUFFER_SIZE: two of the record's three indices remain.
+-        check("index buffer size", true, 2, 1, {0, 1}, 8, false);
++        // Indexed: the third triangle reads indices 0..2 of the index buffer.
++        TextureCacheTestAccess::ClearImage(cache, scheduler.Current(), sparse_color.image_id,
++            {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, {});
++        read_covered("direct indexed draw", RenderExecutorTestAccess::DrawIndex(
++            executor, scheduler.Current(),
++            {.index_count = 9,
++             .index_addr = reinterpret_cast<const void *>(mesh_indices_address),
++             .instance_count = 1, .index_type_and_size = 1}));
++        if (MeshCompute()) {
++          // Run as compute, mesh shaders have no task shader to read the records on the GPU,
++          // so indirect draws are left to the CPU.
++          const DrawIndirectArgs records{mesh_args_address + 3 * stride, 1, stride, {}};
++          Require("GpuMeshIndirectDraw", "compute indirect draw",
++                  !RenderExecutorTestAccess::DrawIndex(
++                      executor, scheduler.Current(),
++                      {.index_count = 9,
++                       .index_addr = reinterpret_cast<const void *>(mesh_indices_address),
++                       .index_type_and_size = 1, .indirect = records}),
++                  "an indirect mesh draw run as compute was not left to the CPU");
++        } else {
++          check("unpatched bases", true, 3, 1, {});
++          // The patched SGPRs replace user data 0/0 with the records' bases.
++          shaders.SetGsUserSgpr(0, 0);
++          shaders.SetGsUserSgpr(1, 0);
++          check("indexed subgroups", true, 0, 2, {0, 1});
++          check("first index and instances", true, 2, 1, {0, 1});
++          check("auto subgroups", false, 4, 2, {0, 1});
++          // Index reads stop at INDEX_BUFFER_SIZE: two of the record's three indices remain.
++          check("index buffer size", true, 2, 1, {0, 1}, 8, false);
++        }
+         LibKernel::Memory::InstallGpuResources(nullptr);
+       }
+ 
